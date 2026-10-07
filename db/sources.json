@@ -1,0 +1,145 @@
+{
+  "schema_version": "2.0",
+  "sources": [
+    {
+      "id": "src-location-hash",
+      "name": "location.hash",
+      "explain": "The URL fragment (everything after #), fully attacker-controlled by crafting a link. Read via location.hash or window.location.hash.substring(1).",
+      "detonates": ["eval", "innerHTML", "document.write", "location.href", "jQuery .html()", "v-html"],
+      "notes": "The fragment is NEVER sent to the server — server-side WAFs and access logs are blind to it. Always URL-encode the payload properly in the PoC link; browsers keep the fragment through redirects."
+    },
+    {
+      "id": "src-location-search",
+      "name": "location.search",
+      "explain": "The query string (?a=b&c=d), attacker-controlled via a crafted link and readable directly or through parsers.",
+      "detonates": ["eval", "innerHTML", "document.cookie", "localStorage", "location.href", "jQuery .html()"],
+      "notes": "Unlike the fragment, the query string IS sent to the server — so a server-side WAF may strip or block obvious payloads; try encoding variants, or prefer the fragment when a sink reads both."
+    },
+    {
+      "id": "src-location-href",
+      "name": "location.href",
+      "explain": "The full URL read as one string and then parsed in JS (split, substring, regex). Attackers control path, query, and fragment portions.",
+      "detonates": ["eval", "innerHTML", "location.href", "document.write"],
+      "notes": "Reviewers often mis-audit this: code that 'parses the URL itself' with indexOf/split frequently confuses which segment it extracted — test whether the tainted portion is the fragment, query, or a path segment the server normalizes."
+    },
+    {
+      "id": "src-location-pathname",
+      "name": "location.pathname",
+      "explain": "The URL path segment, controllable when the app serves the same page under arbitrary paths (SPA fallback routes, 404 echo pages, rewrite rules).",
+      "detonates": ["innerHTML", "document.write", "eval", "jQuery .html()"],
+      "notes": "Server rewrites decide how much of the path you control — probe with /jlf-trace/ segments and check whether the value reaches the page unencoded; percent-encoded characters in the path are decoded by location.pathname."
+    },
+    {
+      "id": "src-urlsearchparams",
+      "name": "URLSearchParams",
+      "explain": "new URLSearchParams(location.search).get('x') — the standard structured way pages extract query parameters before feeding them to sinks.",
+      "detonates": ["innerHTML", "eval", "location.href", "document.cookie", "localStorage"],
+      "notes": ".get() returns the DECODED value — percent-encoding does not neutralize payloads, it just transports them. Also watch .getAll() and iteration patterns that merge repeated parameters."
+    },
+    {
+      "id": "src-query-string-manual-parsing",
+      "name": "query-string-manual-parsing",
+      "explain": "Hand-rolled query parsing (split('&'), split('='), bracket-notation expansion like a[b][c]=v into nested objects) instead of URLSearchParams.",
+      "detonates": ["dynamic path assignment obj[a][b]=v", "Object.assign", "eval", "innerHTML"],
+      "notes": "Bracket-expanding parsers are the #1 dependency-free prototype pollution source: ?__proto__[x]=y walks into Object.prototype. Also check duplicate-key and missing-value edge cases — manual parsers rarely match URLSearchParams semantics."
+    },
+    {
+      "id": "src-postmessage-data",
+      "name": "postMessage-data",
+      "explain": "event.data received by a window 'message' listener — any origin can deliver it unless the handler checks event.origin.",
+      "detonates": ["innerHTML", "eval", "location.href", "document.write", "message event handler"],
+      "notes": "Delivered browser-to-browser: no server ever sees the payload, so WAFs are blind. Your PoC is an attacker page that iframes or opens the target and calls postMessage — always verify the origin check is missing or bypassable (endsWith/includes) before claiming exploitability."
+    },
+    {
+      "id": "src-document-referrer",
+      "name": "document.referrer",
+      "explain": "The Referer of the previous page, read by JS for analytics, theming, or routing decisions.",
+      "detonates": ["innerHTML", "document.write", "eval", "location.href"],
+      "notes": "Attacker-controlled when the victim arrives via a link from the attacker's page (attacker.com/path-payload). Check Referrer-Policy: 'no-referrer' or 'origin' on the LINKING page kills the vector, but the attacker controls their own page's policy — usually fully usable."
+    },
+    {
+      "id": "src-window-name",
+      "name": "window.name",
+      "explain": "A per-tab string that persists across ALL navigations of the tab, including cross-origin ones; any previously visited site can plant it.",
+      "detonates": ["innerHTML", "eval", "document.write", "location.href"],
+      "notes": "Survives cross-origin navigation — attacker page sets window.name then navigates the tab to the target. The target's access log shows a clean request: no query, no fragment. The stealthiest DOM XSS source."
+    },
+    {
+      "id": "src-localstorage",
+      "name": "localStorage",
+      "explain": "Persistent origin-wide key-value store read via localStorage.getItem; values planted earlier (by any page on the origin) are re-read on every visit.",
+      "detonates": ["innerHTML", "eval", "location.href", "document.cookie", "jQuery .html()"],
+      "notes": "Second-order by design: find the WRITE path first (which parameter/API value gets stored), then the READ-into-sink path — the pair is the finding. Survives browser restarts and is shared by every tab on the origin."
+    },
+    {
+      "id": "src-sessionstorage",
+      "name": "sessionStorage",
+      "explain": "Per-tab session-scoped store read via sessionStorage.getItem; planted values survive same-tab navigations (wizard steps, SPA routes).",
+      "detonates": ["innerHTML", "eval", "location.href", "jQuery .html()"],
+      "notes": "Tab-isolated: no cross-tab amplification, but perfect for multi-step flows where step 1 stores and step 4 renders. Dies when the tab closes — PoC must stay in one tab."
+    },
+    {
+      "id": "src-document-cookie",
+      "name": "document.cookie",
+      "explain": "Reading document.cookie returns all non-HttpOnly cookies for the origin as one string; pages parse it in JS for tokens and preferences.",
+      "detonates": ["innerHTML", "eval", "location.href", "fetch-response"],
+      "notes": "Attacker control comes from cookie-setting vectors: a tainted document.cookie WRITE elsewhere, cookie tossing from a sibling subdomain, or CRLF-free server-set cookies reflecting input. HttpOnly blocks the read — check which cookie is actually consumed."
+    },
+    {
+      "id": "src-xhr-response",
+      "name": "xhr-response",
+      "explain": "XMLHttpRequest responseText/responseJSON consumed by the page — attacker-influenced when the API reflects stored user data or when the endpoint itself is attacker-controllable.",
+      "detonates": ["innerHTML", "eval", "localStorage", "jQuery .html()", "dangerouslySetInnerHTML"],
+      "notes": "Stored-XSS carrier: plant the payload via the API (profile field, comment), then it returns in every XHR response. Test response JSON keys for '__proto__' too — merge sinks pollute from parsed responses."
+    },
+    {
+      "id": "src-fetch-response",
+      "name": "fetch-response",
+      "explain": "fetch().then(r => r.json()) results rendered or merged by the page — same taint profile as XHR but dominant in modern SPAs.",
+      "detonates": ["innerHTML", "eval", "localStorage", "_.merge", "dangerouslySetInnerHTML", "v-html"],
+      "notes": "Trace whether the fetched URL itself is attacker-controllable (open redirect/proxy endpoints let you serve fully attacker JSON) — that upgrades reflected data into a fully controlled response body."
+    },
+    {
+      "id": "src-websocket-message",
+      "name": "websocket-message",
+      "explain": "Messages arriving via WebSocket onmessage — tainted when the server relays other users' input (chat, collaboration) or when the socket endpoint accepts unauthenticated cross-origin connections.",
+      "detonates": ["innerHTML", "eval", "document.write", "jQuery .html()"],
+      "notes": "WebSockets are not same-origin restricted — the server must check the Origin header itself; if it does not, YOUR page can open a socket to the target (CSWSH) and both send and receive messages as the victim."
+    },
+    {
+      "id": "src-broadcastchannel-message",
+      "name": "broadcastchannel-message",
+      "explain": "e.data from BroadcastChannel onmessage — posted by ANY same-origin tab, iframe, or worker on the same channel name.",
+      "detonates": ["innerHTML", "eval", "location.href"],
+      "notes": "No origin field exists on BroadcastChannel messages — handlers cannot authenticate the sender at all. Any same-origin injection primitive (even a low-severity one) can post to the channel and detonate every open tab."
+    },
+    {
+      "id": "src-spa-hash-router-param",
+      "name": "spa-hash-router-param",
+      "explain": "Route parameters extracted from the fragment by SPA routers (#/user/<param>, #!/search/<term>) and injected into templates or page state.",
+      "detonates": ["innerHTML", "v-html", "dangerouslySetInnerHTML", "jQuery .html()", "eval"],
+      "notes": "Router params are the fragment, so they never reach the server — WAF-blind. Check whether the router decodes params (most do) and whether route guards or template bindings sanitize before rendering."
+    },
+    {
+      "id": "src-indexeddb",
+      "name": "indexeddb",
+      "explain": "Structured client-side database read via IDBObjectStore.get/cursor; stores whole objects cached from APIs or user input.",
+      "detonates": ["innerHTML", "eval", "dangerouslySetInnerHTML", "jQuery .html()"],
+      "notes": "Second-order like localStorage but stores rich objects — offline-first apps cache entire API responses here, so one poisoned cached record detonates on every offline render. Inspect with DevTools > Application > IndexedDB."
+    },
+    {
+      "id": "src-dom-form-values",
+      "name": "dom-form-values",
+      "explain": "input.value, textarea.value, and form field reads consumed by JS — attacker-controlled when fields are pre-filled from URLs or when the attacker is the one typing (stored/self vectors).",
+      "detonates": ["eval", "innerHTML", "location.href", "dynamic path assignment obj[a][b]=v"],
+      "notes": "Field NAMES matter too: serializers that expand names like 'a[b]' into nested objects are prototype pollution sources. Pure 'victim types payload into a field' chains are self-XSS — find how the field gets pre-filled remotely."
+    },
+    {
+      "id": "src-window-opener",
+      "name": "window.opener",
+      "explain": "Reference to the window that opened the current one; the opener can be re-navigated (reverse tabnabbing) or postMessaged by the opened page, and vice versa.",
+      "detonates": ["location.href", "message event handler", "postMessage"],
+      "notes": "Links/forms with target=_blank and no rel=noopener leave window.opener set: the opened page can set opener.location to a phishing copy of the origin. Modern browsers imply noopener for target=_blank, but explicit window.open calls and older browsers still expose it."
+    }
+  ]
+}

